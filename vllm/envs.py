@@ -218,6 +218,8 @@ if TYPE_CHECKING:
     VLLM_ENABLE_GEMM_RS: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
+    VLLM_MOE_UGPU_LOCALIZATION: bool = False
+    VLLM_MOE_UGPU_KEEP_FULL_WEIGHTS: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
@@ -1681,6 +1683,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_INT4": lambda: bool(
         int(os.getenv("VLLM_USE_FLASHINFER_MOE_INT4", "0"))
+    ),
+    # Split FlashInfer TRTLLM-Gen NVFP4 MoE weights across the GPU's locality
+    # domains and run each GEMM half on its own domain (flashinfer_ugpu).
+    # Loading fails if an NVFP4 TRTLLM-Gen MoE layer cannot be localized.
+    "VLLM_MOE_UGPU_LOCALIZATION": lambda: bool(
+        int(os.getenv("VLLM_MOE_UGPU_LOCALIZATION", "0"))
+    ),
+    # With VLLM_MOE_UGPU_LOCALIZATION, 1 also keeps the full MoE weights
+    # resident, although nothing reads them; for tests only.
+    "VLLM_MOE_UGPU_KEEP_FULL_WEIGHTS": lambda: bool(
+        int(os.getenv("VLLM_MOE_UGPU_KEEP_FULL_WEIGHTS", "0"))
     ),
     # Control the cache sized used by the xgrammar compiler. The default
     # of 512 MB should be enough for roughly 1000 JSON schemas.

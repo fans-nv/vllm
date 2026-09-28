@@ -5518,6 +5518,15 @@ class GPUModelRunner(
 
         else:
             # load weights from kernel format
+            from vllm.model_executor.layers.quantization.utils import (
+                flashinfer_fp4_moe_ugpu,
+            )
+
+            if flashinfer_fp4_moe_ugpu.has_ugpu_moe_localization(model):
+                raise NotImplementedError(
+                    "Kernel-format reload cannot update uGPU-localized MoE "
+                    "weights; reload with `is_checkpoint_format=True`."
+                )
             logger.warning_once(
                 "Reloading with `is_checkpoint_format=True` requires that "
                 "weights be in kernel format and already sharded",

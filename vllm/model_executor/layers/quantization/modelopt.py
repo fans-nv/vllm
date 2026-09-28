@@ -1053,6 +1053,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                 per_token_activation=self.per_token_activation,
                 is_act_and_mul=self.moe.is_act_and_mul,
             ),
+            per_token_activation=self.per_token_activation,
         )
 
         replace_parameter(layer, "w13_weight", w13)

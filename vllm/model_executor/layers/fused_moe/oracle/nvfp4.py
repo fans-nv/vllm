@@ -335,6 +335,7 @@ def convert_to_nvfp4_moe_kernel_format(
     is_act_and_mul: bool,
     use_a16: bool = False,
     trtllm_hidden_alignment: int = 256,
+    per_token_activation: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -421,6 +422,7 @@ def convert_to_nvfp4_moe_kernel_format(
             a2_scale=a2_scale,
             is_act_and_mul=is_act_and_mul,
             trtllm_hidden_alignment=trtllm_hidden_alignment,
+            per_token_activation=per_token_activation,
         )
     elif nvfp4_backend == NvFp4MoeBackend.HUMMING:
         from vllm.model_executor.layers.quantization.utils.humming import (
