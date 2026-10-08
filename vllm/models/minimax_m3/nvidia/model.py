@@ -13,6 +13,7 @@ The MiniMax-M3-preview config selects a single set of branches:
 """
 
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -89,6 +90,10 @@ from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+
+if TYPE_CHECKING:
+    from .sparse_attention_icp import MiniMaxM3SparseICPAttention
+
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
@@ -709,8 +714,18 @@ class MiniMaxM3DecoderLayer(nn.Module):
             force_sparse_attn or layer_id in _sparse_attention_layer_ids(config)
         )
 
+        self.self_attn: (
+            MiniMaxM3SparseAttention | MiniMaxM3SparseICPAttention | MiniMaxM3Attention
+        )
         if is_sparse_attention_layer:
-            self.self_attn = MiniMaxM3SparseAttention(
+            sparse_layer_cls: type[
+                MiniMaxM3SparseAttention | MiniMaxM3SparseICPAttention
+            ] = MiniMaxM3SparseAttention
+            if vllm_config.attention_config.minimax_m3_msa_indexer_backend == "msa_icp":
+                from . import sparse_attention_icp
+
+                sparse_layer_cls = sparse_attention_icp.MiniMaxM3SparseICPAttention
+            self.self_attn = sparse_layer_cls(
                 config=config,
                 layer_id=layer_id,
                 quant_config=quant_config,
@@ -871,6 +886,18 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             layer.fuse_input_allreduce = idx > 0 and prev_defers
             prev_defers = layer.ffn_all_reduce_deferred
         self.fuse_final_norm_allreduce = prev_defers
+
+        if vllm_config.attention_config.minimax_m3_msa_indexer_backend == "msa_icp":
+            from .sparse_attention_icp import bind_model_candidate_exchange
+
+            bind_model_candidate_exchange(self, vllm_config)
+
+    def shutdown_model_resources(self) -> None:
+        """Drain the model-scoped ICP exchange before destroying its TP group."""
+        exchange = getattr(self, "_icp_candidate_exchange", None)
+        if exchange is not None:
+            exchange.close()
+            self._icp_candidate_exchange = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)

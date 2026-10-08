@@ -33,6 +33,7 @@ class DmaCopyBackend:
         self._queue: queue.SimpleQueue | None = None
         self._thread: threading.Thread | None = None
         self._shutdown: bool = False
+        self._submission_lock = threading.Lock()
 
     def init(
         self,
@@ -77,28 +78,38 @@ class DmaCopyBackend:
         events_list: list[tuple[int, torch.Event]],
         wait_event: torch.Event | None = None,
     ) -> None:
-        params = self._store_params if is_store else self._load_params
-        assert params is not None and self._queue is not None
-        self._queue.put(
-            (
-                src_blocks,
-                dst_blocks,
-                params,
-                is_store,
-                event_idx,
-                events_list,
-                wait_event,
+        with self._submission_lock:
+            if self._shutdown:
+                raise RuntimeError("Cannot submit a copy after DMA shutdown")
+            params = self._store_params if is_store else self._load_params
+            assert params is not None and self._queue is not None
+            self._queue.put(
+                (
+                    src_blocks,
+                    dst_blocks,
+                    params,
+                    is_store,
+                    event_idx,
+                    events_list,
+                    wait_event,
+                )
             )
-        )
 
     def shutdown(self) -> None:
-        if self._shutdown:
-            return
-        self._shutdown = True
-        if self._queue is not None:
-            self._queue.put(None)
+        """Drain queued submissions and device work before their owners can exit."""
+        with self._submission_lock:
+            if not self._shutdown:
+                self._shutdown = True
+                if self._queue is not None:
+                    self._queue.put(None)
+        # The FIFO sentinel follows every accepted job, including jobs whose
+        # completion events have not yet been published. A timed join cannot
+        # establish that it is safe to release GPU aliases or registered memory.
         if self._thread is not None:
-            self._thread.join(timeout=5.0)
+            self._thread.join()
+        for stream in (self._load_stream, self._store_stream):
+            if stream is not None:
+                stream.synchronize()
 
     @staticmethod
     def _copy_loop(

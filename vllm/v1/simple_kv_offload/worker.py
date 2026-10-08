@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Worker-side handler for SimpleCPUOffloadConnector."""
 
+import threading
 from typing import TYPE_CHECKING
 
 import torch
@@ -10,7 +11,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
-from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
+from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor, unpin_tensor
 from vllm.v1.simple_kv_offload.disk_backend import DiskBackend
 from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
@@ -56,6 +57,9 @@ class SimpleCPUOffloadWorker:
         self.store_stream: torch.cuda.Stream | None = None
 
         self._backend: DmaCopyBackend | DiskBackend | None = None
+        self._registered_cpu_tensors: list[torch.Tensor] = []
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_complete = False
 
         # Ordered (event_idx, Event). Events pre-allocated on main thread.
         self._load_events: list[tuple[int, torch.Event]] = []
@@ -92,6 +96,8 @@ class SimpleCPUOffloadWorker:
                 by resolving to their underlying raw storage.
 
         """
+        if self._shutdown_complete:
+            raise RuntimeError("Cannot register KV caches after CPU offload shutdown")
         if not kv_caches:
             logger.warning("No KV caches to offload.")
             return
@@ -232,6 +238,7 @@ class SimpleCPUOffloadWorker:
             tensor = torch.zeros(cpu_shape, dtype=gpu_tensor.dtype, device="cpu")
             if pin_memory:
                 pin_tensor(tensor)
+                self._registered_cpu_tensors.append(tensor)
             self.cpu_kv_caches[name] = tensor
 
         self._backend = DmaCopyBackend()
@@ -244,6 +251,8 @@ class SimpleCPUOffloadWorker:
         )
 
     def bind_connector_metadata(self, metadata: SimpleCPUOffloadMetadata) -> None:
+        if self._shutdown_complete:
+            raise RuntimeError("Cannot bind metadata after CPU offload shutdown")
         self._connector_metadata = metadata
         if metadata.load_event >= 0:
             self._pending_load_event_indices.add(metadata.load_event)
@@ -373,3 +382,31 @@ class SimpleCPUOffloadWorker:
         else:
             self._load_hwm = hwm
         return hwm
+
+    def shutdown(self) -> None:
+        """Release CPU-offload owners only after queued and submitted DMA drains."""
+        if self.disk_mode:
+            # DiskBackend owns a separate I/O and staging-buffer lifecycle.
+            # Preserve its existing connector behavior in this CPU-only fix.
+            return
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+            if self._backend is not None:
+                self._backend.shutdown()
+            self._flush_and_sync_all()
+            while self._registered_cpu_tensors:
+                tensor = self._registered_cpu_tensors[-1]
+                unpin_tensor(tensor)
+                self._registered_cpu_tensors.pop()
+            self._connector_metadata = None
+            self._pending_load_event_indices.clear()
+            self._pending_store_event_indices.clear()
+            self._completed_store_events.clear()
+            self._store_compute_done = None
+            self.cpu_kv_caches = None
+            self.gpu_kv_caches = None
+            self._backend = None
+            self.load_stream = None
+            self.store_stream = None
+            self._shutdown_complete = True

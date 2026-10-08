@@ -104,9 +104,15 @@ def test_get_kv_cache_spec_resolves_hisparse_block_size(
 
 
 class _FakeMetadataBuilder:
-    def __init__(self, support: AttentionCGSupport, varlen_bound: int | None = None):
+    def __init__(
+        self,
+        support: AttentionCGSupport,
+        varlen_bound: int | None = None,
+        decode_phase_only: bool = False,
+    ):
         self.support = support
         self.varlen_bound = varlen_bound
+        self.cudagraph_decode_phase_only = decode_phase_only
 
     def get_cudagraph_support(self, *_args):
         return self.support
@@ -141,7 +147,7 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
         0,
     )
     target_group.metadata_builders = [
-        _FakeMetadataBuilder(AttentionCGSupport.ALWAYS)  # type: ignore[list-item]
+        _FakeMetadataBuilder(AttentionCGSupport.ALWAYS, decode_phase_only=True)  # type: ignore[list-item]
     ]
     draft_group = AttentionGroup(
         _DraftBackend,
@@ -158,6 +164,8 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
     unfiltered = get_attn_cg_support(groups, None)
     assert unfiltered.min_cg_support == AttentionCGSupport.UNIFORM_BATCH
     assert unfiltered.min_cg_attn_backend == "_DraftBackend"
+    assert unfiltered.decode_phase_only
+    assert unfiltered.decode_phase_only_backend == "_TargetBackend"
 
     # Adaptive verification validates only the target's varlen graphs.
     target_only = get_attn_cg_support(
@@ -167,6 +175,12 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
     )
     assert target_only.min_cg_support == AttentionCGSupport.ALWAYS
     assert target_only.min_cg_attn_backend is None
+    narrowed = target_only.narrow(AttentionCGSupport.NEVER, "encoder")
+    assert narrowed.decode_phase_only
+    assert narrowed.decode_phase_only_backend == "_TargetBackend"
+    assert not get_attn_cg_support(
+        groups, None, checked_layer_names={"draft"}
+    ).decode_phase_only
     assert (
         get_query_lens_mismatch_unsupported_backend(
             groups,
@@ -490,6 +504,59 @@ def test_reshape_padded_kv_cache_strides_by_padded_page():
     assert kv_cache[1].storage_offset() == spec.page_size_padded // elem_size
     # Within one block the (unpadded) content stays compact.
     assert kv_cache[0].is_contiguous()
+
+
+class _RawPageSpec(FullAttentionSpec):
+    @property
+    def uses_raw_page_view(self) -> bool:
+        return True
+
+
+def _raw_page_spec() -> _RawPageSpec:
+    return _RawPageSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=2,
+        dtype=torch.int8,
+        page_size_padded=64,
+    )
+
+
+def test_raw_page_views_copy_every_byte_with_shared_storage():
+    spec = _raw_page_spec()
+    num_blocks, num_layers = 3, 2
+    raw = torch.arange(num_blocks * num_layers * spec.page_size_bytes, dtype=torch.int8)
+    caches = dense_kv_cache_views(
+        raw, spec, num_blocks, num_layers, KVCacheLayout.LBHNC
+    )
+    assert spec.has_layer_views and spec.uses_slot_mapping
+    assert caches[0].shape == (num_blocks, 1, 1, spec.page_size_bytes)
+    assert caches[1].storage_offset() == num_blocks * spec.page_size_bytes
+    expected = raw.view(num_layers, num_blocks, -1).clone()
+
+    copy_kv_cache_blocks_inplace(
+        caches, num_blocks, [KVCacheBlockCopy(src_block_id=0, dst_block_id=2)]
+    )
+
+    for layer_idx, cache in enumerate(caches):
+        torch.testing.assert_close(cache[2].flatten(), expected[layer_idx, 0])
+        torch.testing.assert_close(cache[1].flatten(), expected[layer_idx, 1])
+
+
+@pytest.mark.parametrize(
+    "layout", [x for x in KVCacheLayout if x != KVCacheLayout.LBHNC]
+)
+def test_raw_page_views_reject_incompatible_layout(layout):
+    with pytest.raises(ValueError, match="require the LBHNC cache layout"):
+        compute_layout_strides(_raw_page_spec(), 3, 2, layout)
+
+
+def test_raw_page_views_reject_kernel_splitting_and_main_only_merge():
+    spec = _raw_page_spec()
+    with pytest.raises(ValueError, match="kernel block splitting"):
+        compute_layout_strides(spec, 3, 2, KVCacheLayout.LBHNC, kernel_block_size=2)
+    with pytest.raises(AssertionError, match="main-only attention spec"):
+        FullAttentionSpec.merge([spec])
 
 
 @pytest.mark.parametrize(

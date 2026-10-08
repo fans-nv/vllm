@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from tests.v1.worker.test_gpu_batch_ordering import _make_runner as _make_batch_runner
 from vllm.config import (
     CompilationConfig,
     CUDAGraphMode,
@@ -19,6 +20,7 @@ from vllm.config import (
 from vllm.distributed.device_communicators import pynccl_allocator
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import cudagraph_utils as gpu_cudagraph_utils
+from vllm.v1.worker.gpu import dp_utils
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBuffers
@@ -305,6 +307,7 @@ def _make_spec_decode_manager(
     max_num_seqs: int = 8,
     use_kda_recoverssm: bool = False,
     varlen_decode: bool = False,
+    decode_phase_only_full_graphs: bool = False,
 ) -> gpu_cudagraph_utils.CudaGraphManager:
     monkeypatch.setattr(
         gpu_cudagraph_utils,
@@ -328,9 +331,138 @@ def _make_spec_decode_manager(
         cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
         decode_query_len=decode_query_len,
         varlen_decode=varlen_decode,
+        decode_phase_only_full_graphs=decode_phase_only_full_graphs,
     )
     manager._graphs_captured = True
     return manager
+
+
+@pytest.mark.parametrize("query_len", [1, 4])
+@pytest.mark.parametrize("varlen", [False, True])
+def test_short_prefill_cannot_replay_decode_phase_graph(monkeypatch, query_len, varlen):
+    manager = _make_spec_decode_manager(
+        monkeypatch,
+        decode_query_len=query_len,
+        capture_sizes=[4, 8],
+        decode_phase_only_full_graphs=True,
+        varlen_decode=varlen,
+    )
+    batch = dict(
+        num_reqs=2,
+        num_tokens=2 * query_len,
+        uniform_token_count=None if varlen else query_len,
+        num_active_loras=0,
+        max_query_len=query_len,
+    )
+    decode = manager.dispatch(**batch, has_prefill=False)
+    assert decode.cg_mode == CUDAGraphMode.FULL
+    assert decode.decode_phase_only
+    prefill = manager.dispatch(**batch, has_prefill=True)
+    assert prefill.cg_mode == CUDAGraphMode.PIECEWISE
+    assert not prefill.decode_phase_only
+    manager.check_phase_admission(decode, False)
+    with pytest.raises(RuntimeError, match="cannot replay"):
+        manager.check_phase_admission(decode, True)
+    with pytest.raises(RuntimeError, match="requires has_prefill"):
+        manager.dispatch(**batch)
+
+
+@pytest.mark.parametrize("restricted", [False, True])
+@pytest.mark.parametrize("query_len", [1, 4])
+def test_promoted_prompt_tail_keeps_actual_phase(monkeypatch, restricted, query_len):
+    runner = _make_batch_runner(
+        {"decode": (16, 16), "tail": (128, 129)}, decode_query_len=query_len
+    )
+    scheduled = SimpleNamespace(
+        num_scheduled_tokens={"decode": query_len, "tail": query_len},
+        total_num_scheduled_tokens=2 * query_len,
+        scheduled_spec_decode_tokens={
+            "decode": [-1] * (query_len - 1),
+            "tail": [-1] * (query_len - 1),
+        },
+    )
+    state, uniform_count = runner.gather_batch_req_state(scheduled, False)
+    assert state.has_prefill and state.decode_graph_eligible
+    assert uniform_count == query_len
+    assert state.is_prefilling_np.tolist() == [False, True]
+    manager = _make_spec_decode_manager(
+        monkeypatch,
+        decode_query_len=query_len,
+        capture_sizes=[4, 8],
+        decode_phase_only_full_graphs=restricted,
+    )
+    desc, _ = dispatch_cg_and_sync_dp(
+        manager,
+        num_reqs=2,
+        num_tokens=state.num_tokens,
+        uniform_token_count=uniform_count,
+        dp_size=1,
+        dp_rank=0,
+        max_query_len=None,
+        has_prefill=state.has_prefill,
+    )
+    assert desc.cg_mode == (
+        CUDAGraphMode.PIECEWISE if restricted else CUDAGraphMode.FULL
+    )
+
+
+@pytest.mark.parametrize("prefill_rank", [None, 0, 1])
+@pytest.mark.parametrize("dp_rank", [0, 1])
+def test_dp_redispatch_and_reuse_agree_on_actual_phase(
+    monkeypatch, prefill_rank, dp_rank
+):
+    manager = _make_spec_decode_manager(
+        monkeypatch,
+        decode_query_len=1,
+        capture_sizes=[4, 8],
+        decode_phase_only_full_graphs=True,
+    )
+    # A promoted one-token prefill has the same shape as a pure decode.
+    phases = [rank == prefill_rank for rank in range(2)]
+    reduced = torch.tensor(
+        [
+            [4, 4],
+            [
+                (CUDAGraphMode.PIECEWISE if phase else CUDAGraphMode.FULL).value
+                for phase in phases
+            ],
+            [1, 1],
+            [-1 if phase else 1 for phase in phases],
+            [0, 0],
+            [4, 4],
+            [int(phase) for phase in phases],
+        ],
+        dtype=torch.int32,
+    )
+    collectives = []
+
+    def all_reduce(tensor, group):
+        collectives.append(tensor.clone())
+        tensor.copy_(reduced)
+
+    monkeypatch.setattr(dp_utils.dist, "all_reduce", all_reduce)
+    monkeypatch.setattr(
+        dp_utils, "get_dp_group", lambda: SimpleNamespace(cpu_group=None)
+    )
+    monkeypatch.setattr(dp_utils, "should_skip_dp_coordination", lambda: False)
+    batch = dict(
+        num_reqs=4,
+        num_tokens=4,
+        uniform_token_count=1,
+        dp_size=2,
+        dp_rank=dp_rank,
+        max_query_len=None if phases[dp_rank] else 1,
+        has_prefill=phases[dp_rank],
+    )
+    desc, sync = dispatch_cg_and_sync_dp(manager, **batch)
+    assert sync is not None
+    assert sync.has_prefill == any(phases)
+    assert desc.cg_mode == (
+        CUDAGraphMode.PIECEWISE if any(phases) else CUDAGraphMode.FULL
+    )
+    reused, _ = dispatch_cg_and_sync_dp(manager, **batch, dp_sync=sync)
+    assert reused == desc
+    assert len(collectives) == 1
 
 
 def test_uniform_decode_pads_up_to_full_graph(monkeypatch):

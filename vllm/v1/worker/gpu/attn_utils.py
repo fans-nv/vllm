@@ -55,6 +55,8 @@ if TYPE_CHECKING:
 class AttentionCGSupportInfo:
     min_cg_support: AttentionCGSupport = AttentionCGSupport.ALWAYS
     min_cg_attn_backend: str | None = None
+    decode_phase_only: bool = False
+    decode_phase_only_backend: str | None = None
 
     def narrow(
         self, support: AttentionCGSupport, backend: str | None
@@ -65,7 +67,9 @@ class AttentionCGSupportInfo:
         encoder-only layers) contribute to the runner's cudagraph decision.
         """
         if support.value < self.min_cg_support.value:
-            return AttentionCGSupportInfo(support, backend)
+            return AttentionCGSupportInfo(
+                support, backend, self.decode_phase_only, self.decode_phase_only_backend
+            )
         return self
 
 
@@ -120,6 +124,7 @@ class FastPrefillHelper:
             num_tokens=num_logits,
             uniform_token_count=None,
             num_active_loras=num_active_loras,
+            has_prefill=has_prefill,
         )
         num_logits_padded = min(desc.num_tokens, self.max_num_tokens)
         return FastPrefillBatchMetadata(
@@ -298,6 +303,8 @@ def get_attn_cg_support(
     """Return the weakest CUDA graph support among the checked layers."""
     min_cg_support = AttentionCGSupport.ALWAYS
     min_cg_attn_backend = None
+    decode_phase_only = False
+    decode_phase_only_backend = None
     for groups in attn_groups:
         for group in groups:
             if checked_layer_names is not None and checked_layer_names.isdisjoint(
@@ -312,9 +319,14 @@ def get_attn_cg_support(
             if cg_support.value < min_cg_support.value:
                 min_cg_support = cg_support
                 min_cg_attn_backend = group.backend.__name__
+            if getattr(builder, "cudagraph_decode_phase_only", False):
+                decode_phase_only = True
+                decode_phase_only_backend = group.backend.__name__
     return AttentionCGSupportInfo(
         min_cg_support=min_cg_support,
         min_cg_attn_backend=min_cg_attn_backend,
+        decode_phase_only=decode_phase_only,
+        decode_phase_only_backend=decode_phase_only_backend,
     )
 
 

@@ -146,7 +146,7 @@ from vllm.v1.worker.gpu.sample.logits_processor import build_custom_logits_proce
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
-from vllm.v1.worker.gpu.shutdown import free_before_shutdown
+from vllm.v1.worker.gpu.shutdown import free_before_shutdown, shutdown_model_resources
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
@@ -743,7 +743,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             lora_capture_cases=self.lora_capture_cases,
             varlen_decode=self.adaptive_verification is not None,
             ubatch_runner=self.ubatch_runner,
+            decode_phase_only_full_graphs=attn_cg_support.decode_phase_only,
         )
+        if attn_cg_support.decode_phase_only:
+            logger.info(
+                "Backend %s restricts FULL cudagraph replay to batches with "
+                "no prefilling requests.",
+                attn_cg_support.decode_phase_only_backend,
+            )
         if self.cache_config.kv_sharing_fast_prefill and self.pcp_manager is None:
             self.fast_prefill = FastPrefillHelper(
                 self.cudagraph_manager, self.max_num_tokens
@@ -1739,6 +1746,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         batch_req_state, uniform_tok_count = self.gather_batch_req_state(
             scheduler_output, dummy_run
         )
+        has_prefill = (
+            batch_req_state.has_prefill if batch_req_state is not None else False
+        )
         if batch_req_state is not None:
             num_toks = batch_req_state.num_tokens
             if batch_req_state.has_prefill:
@@ -1780,6 +1790,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.ubatch_runner is not None and not skip_attn_for_dummy_run
             ),
             uniform_decode=uniform_tok_count == self.decode_query_len,
+            has_prefill=has_prefill,
         )
 
         if batch_desc.num_tokens == 0:
@@ -1993,6 +2004,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector.pre_forward(
                 **connector_kwargs, attn_metadata=attn_metadata
             )
+            self.cudagraph_manager.check_phase_admission(batch_desc, has_prefill)
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
@@ -2360,11 +2372,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if hasattr(self, "model_state") and self.model_state.supports_mm_inputs:
             self.model_state.encoder_runner.clear()
         free_before_shutdown(self.vllm_config)
+        speculator = getattr(self, "speculator", None)
+        shutdown_model_resources(
+            (
+                getattr(self, "model", None),
+                getattr(speculator, "model", None),
+            )
+        )
         if hasattr(self, "model_state"):
             del self.model_state
         # Detach the layer-level KV/state cache tensors before dropping the
         # models; the model objects can outlive this runner.
-        speculator = getattr(self, "speculator", None)
         if speculator is not None:
             if draft_model := getattr(speculator, "model", None):
                 clear_layer_kv_caches(draft_model.modules())

@@ -1,0 +1,5 @@
+# Only for minimax_m3_msa_indexer_backend=msa_icp. Install the companion MSA
+# dev source/wheel with fmha_sm100.icp support before this file. The published
+# version number alone does not establish the required kernel capabilities;
+# startup checks the integration and native producer contracts.
+fmha-sm100
