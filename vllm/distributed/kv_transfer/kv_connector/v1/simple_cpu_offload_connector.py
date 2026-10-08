@@ -248,6 +248,10 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             return self.worker_handler.build_connector_worker_meta()
         return None
 
+    def shutdown(self) -> None:
+        if self.worker_handler is not None:
+            self.worker_handler.shutdown()
+
     # --- Scheduler-side methods ---
 
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:

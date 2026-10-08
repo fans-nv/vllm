@@ -12,6 +12,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 IndexerKVDType = Literal["auto", "bf16", "fp8", "mxfp4", "nvfp4"]
 MiniMaxM3MSADecodeBackend = Literal["triton", "cutlass"]
+MiniMaxM3MSAIndexerBackend = Literal["default", "msa_icp"]
 
 
 @config
@@ -42,6 +43,11 @@ class AttentionConfig:
 
     minimax_m3_msa_decode_backend: MiniMaxM3MSADecodeBackend = "triton"
     """Sparse decode kernel used by the MiniMax M3 MSA backend."""
+
+    minimax_m3_msa_indexer_backend: MiniMaxM3MSAIndexerBackend = "default"
+    """Use `msa_icp` for the opt-in TP2/P128 compound-cache indexer.
+    Requires `minimax_m3_msa_decode_backend="cutlass"` and companion MSA ICP
+    kernels. The default preserves the ordinary MiniMax M3 indexer."""
 
     backend_per_kind: dict[str, AttentionBackendEnum] = field(default_factory=dict)
     """Per-KV-cache-group attention backend overrides, keyed by

@@ -383,7 +383,29 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
     const std::string& kv_cache_dtype, bool skip_index_branch,
     std::optional<torch::stable::Tensor> q_fp8_out, double q_fp8_scale,
     std::optional<torch::stable::Tensor> kv_k_scale,
-    std::optional<torch::stable::Tensor> kv_v_scale);
+    std::optional<torch::stable::Tensor> kv_v_scale, int64_t index_block_tokens,
+    int64_t index_rows_per_rank, int64_t index_rank, int64_t index_world_size,
+    bool enable_pdl, bool write_icp_metadata,
+    std::optional<torch::stable::Tensor> icp_query_start_loc,
+    std::optional<torch::stable::Tensor> icp_seq_lens, int64_t icp_num_reqs,
+    std::optional<torch::stable::Tensor> icp_positions,
+    std::optional<torch::stable::Tensor> icp_active,
+    std::optional<torch::stable::Tensor> icp_local_nvalid,
+    std::optional<torch::stable::Tensor> icp_local_forced,
+    std::optional<torch::stable::Tensor> icp_global_nvalid,
+    std::optional<torch::stable::Tensor> icp_forced,
+    std::optional<torch::stable::Tensor> icp_n_ordinary,
+    std::optional<torch::stable::Tensor> icp_candidates,
+    std::optional<torch::stable::Tensor> icp_qo_offsets,
+    int64_t icp_chunk_width,
+    std::optional<torch::stable::Tensor> icp_plan_segments,
+    std::optional<torch::stable::Tensor> icp_plan_work,
+    std::optional<torch::stable::Tensor> icp_plan_header,
+    int64_t icp_plan_num_ctas, int64_t icp_plan_num_heads,
+    std::optional<torch::stable::Tensor> icp_plan_ranges,
+    int64_t icp_plan_max_splits, int64_t icp_plan_row_begin,
+    int64_t icp_plan_tile_pages, int64_t icp_plan_min_split_tiles,
+    int64_t icp_plan_abi);
 
 #ifdef VLLM_ENABLE_FUSED_KDA_DECODE
 void fused_kda_decode(

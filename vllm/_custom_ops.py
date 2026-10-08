@@ -3,7 +3,7 @@
 
 from enum import IntEnum
 from functools import cache
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Protocol
 
 import torch
 
@@ -2563,6 +2563,22 @@ def reshape_and_cache_flash(
     )
 
 
+class MiniMaxM3IcpDevicePlan(Protocol):
+    """Host-only interface to the preallocated MSA device-plan store."""
+
+    abi_version: int
+
+    def writer_kwargs(self) -> dict[str, torch.Tensor | int]: ...
+
+    def check_writer_launch(
+        self, *, chunk_width: int, num_rows: int, row_begin: int = 0
+    ) -> None: ...
+
+    def note_writer_launch(
+        self, *, chunk_width: int, num_rows: int, row_begin: int = 0
+    ) -> None: ...
+
+
 def fused_minimax_m3_qknorm_rope_kv_insert(
     qkv: torch.Tensor,
     q_norm_weight: torch.Tensor,
@@ -2589,6 +2605,28 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
     q_fp8_scale: float = 1.0,
     kv_k_scale: torch.Tensor | None = None,
     kv_v_scale: torch.Tensor | None = None,
+    *,
+    index_block_tokens: int = 0,
+    index_rows_per_rank: int = 0,
+    index_rank: int = 0,
+    index_world_size: int = 0,
+    enable_pdl: bool = True,
+    write_icp_metadata: bool = False,
+    icp_query_start_loc: torch.Tensor | None = None,
+    icp_seq_lens: torch.Tensor | None = None,
+    icp_num_reqs: int = 0,
+    icp_positions: torch.Tensor | None = None,
+    icp_active: torch.Tensor | None = None,
+    icp_local_nvalid: torch.Tensor | None = None,
+    icp_local_forced: torch.Tensor | None = None,
+    icp_global_nvalid: torch.Tensor | None = None,
+    icp_forced: torch.Tensor | None = None,
+    icp_n_ordinary: torch.Tensor | None = None,
+    icp_candidates: torch.Tensor | None = None,
+    icp_qo_offsets: torch.Tensor | None = None,
+    icp_chunk_width: int = 0,
+    icp_plan_row_begin: int = 0,
+    icp_device_plan: MiniMaxM3IcpDevicePlan | None = None,
 ) -> None:
     """Fused MiniMax-M3 attention pre-processing (in-place).
 
@@ -2625,7 +2663,81 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
     ``[index_q | index_k]`` tail, but the kernel only processes the main q/k/v
     branches and main KV cache. This is used by MiniMax-M3 index-topk reuse
     layers that consume top-k block ids selected by an earlier sparse layer.
+
+    ``index_world_size=2`` enables TP2/Q32/KV2/I4/P128/R64 ICP with
+    ``enable_pdl=False`` and unit Q scale. Main KV retains the per-head slot
+    layout above, including the parent page stride. ICP preserves its
+    reciprocal-multiply NVFP4 quantization and direct FP32-to-FP8 index Q;
+    ordinary calls retain model-dtype-rounded index Q and public NVFP4 math.
+    Main Q is also stored in model dtype (in ``q_out`` when supplied).
+    Rank ownership affects only the FP8 ``[pages,64,128]`` index fragment.
+
+    ``write_icp_metadata=True`` adds live metadata and optional ABI-3 plan
+    CTAs to the same producer grid. ``icp_device_plan`` is preallocated; its
+    generation advances only after a successful native launch.
     """
+    # Keep the ordinary call compatible with existing compiled extensions.
+    # ICP capability is checked once by the model when it opts in.
+    icp_kwargs: dict[str, torch.Tensor | int | bool | None] = {}
+    if (
+        index_world_size
+        or index_block_tokens
+        or index_rows_per_rank
+        or index_rank
+        or not enable_pdl
+        or write_icp_metadata
+        or icp_device_plan is not None
+        or icp_query_start_loc is not None
+        or icp_seq_lens is not None
+        or icp_positions is not None
+        or icp_active is not None
+        or icp_local_nvalid is not None
+        or icp_local_forced is not None
+        or icp_global_nvalid is not None
+        or icp_forced is not None
+        or icp_n_ordinary is not None
+        or icp_candidates is not None
+        or icp_qo_offsets is not None
+        or icp_num_reqs
+        or icp_chunk_width
+        or icp_plan_row_begin
+    ):
+        icp_kwargs = dict(
+            index_block_tokens=index_block_tokens,
+            index_rows_per_rank=index_rows_per_rank,
+            index_rank=index_rank,
+            index_world_size=index_world_size,
+            enable_pdl=enable_pdl,
+            write_icp_metadata=write_icp_metadata,
+            icp_query_start_loc=icp_query_start_loc,
+            icp_seq_lens=icp_seq_lens,
+            icp_num_reqs=icp_num_reqs,
+            icp_positions=icp_positions,
+            icp_active=icp_active,
+            icp_local_nvalid=icp_local_nvalid,
+            icp_local_forced=icp_local_forced,
+            icp_global_nvalid=icp_global_nvalid,
+            icp_forced=icp_forced,
+            icp_n_ordinary=icp_n_ordinary,
+            icp_candidates=icp_candidates,
+            icp_qo_offsets=icp_qo_offsets,
+            icp_chunk_width=icp_chunk_width,
+            icp_plan_row_begin=icp_plan_row_begin,
+            icp_plan_abi=3,
+        )
+    if icp_device_plan is not None:
+        if not write_icp_metadata or icp_positions is None:
+            raise ValueError(
+                "icp_device_plan requires write_icp_metadata=True and icp_positions"
+            )
+        if icp_device_plan.abi_version != 3:
+            raise RuntimeError("MiniMax-M3 native writer requires device-plan ABI 3")
+        icp_device_plan.check_writer_launch(
+            chunk_width=icp_chunk_width,
+            num_rows=icp_positions.numel(),
+            row_begin=icp_plan_row_begin,
+        )
+        icp_kwargs.update(icp_device_plan.writer_kwargs())
     torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert(
         qkv,
         q_norm_weight,
@@ -2652,7 +2764,15 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
         q_fp8_scale,
         kv_k_scale,
         kv_v_scale,
+        **icp_kwargs,
     )
+    if icp_device_plan is not None:
+        assert icp_positions is not None
+        icp_device_plan.note_writer_launch(
+            chunk_width=icp_chunk_width,
+            num_rows=icp_positions.numel(),
+            row_begin=icp_plan_row_begin,
+        )
 
 
 def fused_kda_decode(

@@ -78,6 +78,7 @@ class BatchExecutionDescriptor:
     num_active_loras: int = 0
     # Number of microbatches the batch is split into (DBO). 1 means no splitting.
     num_ubatches: int = 1
+    decode_phase_only: bool = False
 
 
 def make_cudagraph_stats(
@@ -111,6 +112,7 @@ def _is_compatible(
     num_active_loras: int,
     max_query_len: int | None,
     num_ubatches: int,
+    has_prefill: bool | None = None,
 ) -> bool:
     # desc.uniform_token_count=None (PIECEWISE) can handle any uniform_token_count
     # desc.num_reqs=None means no request padding needed (PIECEWISE)
@@ -130,6 +132,7 @@ def _is_compatible(
         and desc.num_tokens >= num_tokens
         and desc.num_active_loras == num_active_loras
         and desc.num_ubatches == num_ubatches
+        and (not desc.decode_phase_only or has_prefill is False)
     )
 
 
@@ -152,6 +155,7 @@ class CudaGraphManager:
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
         ubatch_runner: "UBatchRunner | None" = None,
+        decode_phase_only_full_graphs: bool = False,
     ):
         self.vllm_config = vllm_config
         self.device = device
@@ -161,6 +165,7 @@ class CudaGraphManager:
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
         self.varlen_decode = varlen_decode
+        self.decode_phase_only_full_graphs = decode_phase_only_full_graphs
         # DBO supports FULL CUDA graphs only.
         self.ubatch_runner = ubatch_runner
 
@@ -220,6 +225,9 @@ class CudaGraphManager:
             return num_active_loras
         # Counts above the largest captured case clamp to it.
         return self._lora_dispatch_map.get(num_active_loras, self._max_lora_case)
+
+    def _is_decode_phase_only(self, cg_mode: CUDAGraphMode) -> bool:
+        return self.decode_phase_only_full_graphs and cg_mode == CUDAGraphMode.FULL
 
     def _maybe_ubatch_twin(
         self, desc: BatchExecutionDescriptor
@@ -309,6 +317,7 @@ class CudaGraphManager:
                     num_reqs=min(num_tokens, self.max_num_reqs),
                     max_query_len=self.decode_query_len,
                     num_active_loras=num_active_loras,
+                    decode_phase_only=self._is_decode_phase_only(decode_mode),
                 )
                 descs_by_mode[decode_mode].append(desc)
             # Capture uniform decode specfifc graphs if required
@@ -331,6 +340,7 @@ class CudaGraphManager:
                         num_reqs=rounded_num_reqs,
                         uniform_token_count=decode_query_len,
                         num_active_loras=num_active_loras,
+                        decode_phase_only=self._is_decode_phase_only(decode_mode),
                     )
 
                     # avoid duplicate graphs
@@ -361,6 +371,7 @@ class CudaGraphManager:
                     num_tokens=num_tokens,
                     num_reqs=num_reqs,
                     num_active_loras=num_active_loras,
+                    decode_phase_only=self._is_decode_phase_only(mixed_mode),
                 )
                 descs_by_mode[mixed_mode].append(desc)
 
@@ -523,8 +534,11 @@ class CudaGraphManager:
         num_active_loras: int,
         max_query_len: int | None = None,
         num_ubatches: int = 1,
+        has_prefill: bool | None = None,
     ) -> BatchExecutionDescriptor:
         """Find matching cudagraph descriptor from priority-ordered candidates."""
+        if self.decode_phase_only_full_graphs and has_prefill is None:
+            raise RuntimeError("Decode-phase-only graph dispatch requires has_prefill")
         effective_loras = self._resolve_effective_loras(num_active_loras)
         key = (num_tokens, effective_loras)
         if self._graphs_captured and num_tokens > 0 and key in self._candidates:
@@ -537,6 +551,7 @@ class CudaGraphManager:
                     effective_loras,
                     max_query_len,
                     num_ubatches,
+                    has_prefill,
                 ):
                     return desc
         return BatchExecutionDescriptor(
@@ -546,6 +561,14 @@ class CudaGraphManager:
             num_active_loras=effective_loras,
             num_ubatches=num_ubatches,
         )
+
+    def check_phase_admission(
+        self, desc: BatchExecutionDescriptor, has_prefill: bool | None
+    ) -> None:
+        if desc.decode_phase_only and has_prefill is not False:
+            raise RuntimeError(
+                f"Decode-phase-only graph cannot replay with has_prefill={has_prefill}"
+            )
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor):
         """Replay a captured FULL cudagraph."""
@@ -588,6 +611,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
         ubatch_runner: "UBatchRunner | None" = None,
+        decode_phase_only_full_graphs: bool = False,
     ):
         super().__init__(
             vllm_config,
@@ -597,6 +621,7 @@ class ModelCudaGraphManager(CudaGraphManager):
             lora_capture_cases=lora_capture_cases,
             varlen_decode=varlen_decode,
             ubatch_runner=ubatch_runner,
+            decode_phase_only_full_graphs=decode_phase_only_full_graphs,
         )
         self.hidden_states: torch.Tensor | None = None
         self.aux_hidden_states: list[torch.Tensor] = []

@@ -278,6 +278,11 @@ class KVCacheSpec:
         return True
 
     @property
+    def uses_raw_page_view(self) -> bool:
+        """Whether the layer view must expose every page byte for KV lifecycle."""
+        return False
+
+    @property
     def uses_slot_mapping(self) -> bool:
         """Whether the worker computes a per-token slot mapping for this spec.
 
@@ -306,6 +311,12 @@ def compute_layer_kv_cache_shape_bytes(
 ) -> tuple[int, ...]:
     """Return the 4D logical shape ``(B, H, N, C)`` where C is in bytes."""
     bs = kernel_block_size if kernel_block_size is not None else spec.block_size
+    if spec.uses_raw_page_view:
+        if bs != spec.block_size:
+            raise ValueError(
+                "Raw compound KV pages do not support kernel block splitting"
+            )
+        return (num_blocks, 1, 1, spec.page_size_bytes)
     assert spec.block_size % bs == 0, (
         f"Kernel block size {bs} must divide KV cache block size {spec.block_size}."
     )
@@ -327,6 +338,8 @@ def compute_layout_strides(
     fixed_strides: tuple[int | None, ...] = (None,) * 5,
 ) -> tuple[int, ...]:
     """Byte strides in logical ``[L, B, H, N, C]`` axis order."""
+    if spec.uses_raw_page_view and layout != KVCacheLayout.LBHNC:
+        raise ValueError("Raw compound KV pages require the LBHNC cache layout")
     assert len(fixed_strides) == 5
     assert all(stride is None or stride > 0 for stride in fixed_strides)
     shape = (
@@ -608,6 +621,9 @@ class FullAttentionSpec(AttentionSpec):
         """
         assert all(isinstance(spec, FullAttentionSpec) for spec in specs), (
             "All attention layers in the same KV cache group must be FullAttentionSpec."
+        )
+        assert not any(spec.uses_raw_page_view for spec in specs), (
+            "Raw compound pages cannot be merged into a main-only attention spec."
         )
 
         sliding_window = set(
