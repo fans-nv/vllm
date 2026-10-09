@@ -12,6 +12,7 @@ The MiniMax-M3-preview config selects a single set of branches:
       "index" attention branch.
 """
 
+import dataclasses
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
@@ -99,6 +100,16 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     get_kv_quant_mode,
 )
+
+
+def dense_layer_cache_config(cache_config: CacheConfig | None) -> CacheConfig | None:
+    """Keep dense layers in FP8 when sparse MSA layers use NVFP4."""
+    if (
+        cache_config is not None
+        and get_kv_quant_mode(cache_config.cache_dtype).is_nvfp4
+    ):
+        return dataclasses.replace(cache_config, cache_dtype="fp8")
+    return cache_config
 
 
 def _sparse_attention_layer_ids(config: PreTrainedConfig) -> set[int]:
@@ -363,7 +374,7 @@ class MiniMaxM3Attention(nn.Module):
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
-            cache_config=cache_config,
+            cache_config=dense_layer_cache_config(cache_config),
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
         )

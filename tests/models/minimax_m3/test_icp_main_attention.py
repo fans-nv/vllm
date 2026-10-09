@@ -20,6 +20,30 @@ from vllm.models.minimax_m3.common.sparse_attention import (
 from vllm.models.minimax_m3.nvidia import msa_icp_main as main
 
 
+def test_dense_nvfp4_policy_preserves_shared_sparse_cache_config():
+    from vllm.config import CacheConfig
+    from vllm.models.minimax_m3.nvidia.model import dense_layer_cache_config
+
+    sparse = CacheConfig(
+        cache_dtype="nvfp4", block_size=128, enable_prefix_caching=False
+    )
+    dense = dense_layer_cache_config(sparse)
+    assert dense is not sparse
+    assert dense.cache_dtype == "fp8"
+    assert sparse.cache_dtype == "nvfp4"
+    assert dense.block_size == sparse.block_size == 128
+    assert dense.enable_prefix_caching is sparse.enable_prefix_caching is False
+
+
+@pytest.mark.parametrize("cache_dtype", [None, "auto", "fp8", "bfloat16"])
+def test_dense_cache_policy_preserves_other_configurations(cache_dtype):
+    from vllm.config import CacheConfig
+    from vllm.models.minimax_m3.nvidia.model import dense_layer_cache_config
+
+    config = None if cache_dtype is None else CacheConfig(cache_dtype=cache_dtype)
+    assert dense_layer_cache_config(config) is config
+
+
 @pytest.mark.parametrize("prefix", [0, 16])
 def test_compound_views_use_public_per_head_slots_without_repacking(prefix):
     pytest.importorskip("fmha_sm100.icp")
