@@ -10,7 +10,6 @@ import torch
 from vllm.models.minimax_m3.common.compound_page import (
     CompoundPageError,
     CompoundPageLayout,
-    SparseMainFormat,
     bind_compound_cache,
 )
 from vllm.models.minimax_m3.common.compound_spec import MiniMaxM3CompoundSpec
@@ -30,7 +29,7 @@ PAGE_BYTES = 45_056
 
 @pytest.fixture
 def layout():
-    return CompoundPageLayout.build(tp_size=2, main_format=SparseMainFormat.NVFP4)
+    return CompoundPageLayout.build(tp_size=2)
 
 
 @pytest.fixture

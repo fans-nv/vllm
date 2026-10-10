@@ -10,7 +10,6 @@ import torch
 from vllm.config import CacheConfig
 from vllm.models.minimax_m3.common.compound_page import (
     CompoundPageLayout,
-    SparseMainFormat,
     bind_compound_cache,
     compound_cache_identity,
 )
@@ -91,8 +90,19 @@ class _Layer:
 
 def test_dense_draft_compound_group_keeps_raw_lifetime_and_attention(monkeypatch):
     monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
-    layout = CompoundPageLayout.build(tp_size=2, main_format=SparseMainFormat.NVFP4)
-    compound = MiniMaxM3CompoundSpec.from_compound_layout(layout)
+    layout = CompoundPageLayout.build(tp_size=2)
+    compound = MiniMaxM3CompoundSpec.from_main_spec(
+        FullAttentionSpec(
+            block_size=128,
+            num_kv_heads=2,
+            head_size=128,
+            dtype=torch.uint8,
+            kv_quant_mode=KVQuantMode.NVFP4,
+            num_head_slots=4,
+            state_content_bytes=72,
+        ),
+        layout,
+    )
     dense = FullAttentionSpec(
         block_size=128,
         num_kv_heads=2,

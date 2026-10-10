@@ -88,28 +88,6 @@ class MiniMaxM3CompoundSpec(FullAttentionSpec):
         return spec
 
     @classmethod
-    def from_compound_layout(cls, layout: CompoundPageLayout, **kwargs) -> Self:
-        """Compatibility factory with the current backend's packed main fields."""
-        from vllm.models.minimax_m3.common.compound_page import (
-            CompoundPageError,
-            SparseMainFormat,
-        )
-
-        if layout.main_format is not SparseMainFormat.NVFP4:
-            raise CompoundPageError("MiniMax-M3 compound pages require plain NVFP4")
-        main_spec = FullAttentionSpec(
-            block_size=layout.physical_page_tokens,
-            num_kv_heads=layout.main_num_kv_heads,
-            head_size=layout.main_head_dim,
-            dtype=torch.uint8,
-            kv_quant_mode=KVQuantMode.NVFP4,
-            num_head_slots=2 * layout.main_num_kv_heads,
-            state_content_bytes=layout.main_element_dim,
-            **kwargs,
-        )
-        return cls.from_main_spec(main_spec, layout)
-
-    @classmethod
     def merge(cls, specs: list[Self]) -> Self:
         assert all(isinstance(spec, cls) for spec in specs), (
             "Compound pages cannot merge with main-only attention specs."

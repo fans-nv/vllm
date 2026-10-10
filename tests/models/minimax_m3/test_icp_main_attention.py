@@ -11,7 +11,6 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from vllm.models.minimax_m3.common.compound_page import (
     CompoundPageLayout,
-    SparseMainFormat,
     bind_compound_cache,
 )
 from vllm.models.minimax_m3.common.sparse_attention import (
@@ -47,7 +46,7 @@ def test_dense_cache_policy_preserves_other_configurations(cache_dtype):
 @pytest.mark.parametrize("prefix", [0, 16])
 def test_compound_views_use_public_per_head_slots_without_repacking(prefix):
     pytest.importorskip("fmha_sm100.icp")
-    layout = CompoundPageLayout.build(tp_size=2, main_format=SparseMainFormat.NVFP4)
+    layout = CompoundPageLayout.build(tp_size=2)
     storage = torch.empty(prefix + 3 * layout.compound_span_bytes, dtype=torch.uint8)
     raw = storage[prefix:].view(3, 1, 1, layout.compound_span_bytes)
     bound = bind_compound_cache(raw, layout, 0)

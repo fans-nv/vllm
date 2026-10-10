@@ -20,6 +20,7 @@ from vllm.distributed import (
     get_tp_group,
 )
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import set_default_quant_scales
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import (
@@ -32,7 +33,6 @@ from vllm.models.minimax_m3.common.compound_page import (
     BoundCompoundCache,
     CompoundPageError,
     CompoundPageLayout,
-    SparseMainFormat,
     bind_compound_cache,
     compound_cache_identity,
 )
@@ -64,7 +64,6 @@ from vllm.models.minimax_m3.nvidia.msa_icp_main import (
     MiniMaxM3SparseICPMetadata,
     get_icp_main_decode_plans,
 )
-from vllm.models.minimax_m3.nvidia.ops.icp_dispatch import create_candidate_exchange
 from vllm.models.minimax_m3.nvidia.ops.icp_metadata import launch_icp_kv_write
 from vllm.models.minimax_m3.nvidia.sparse_attention_msa import (
     MiniMaxM3SparseMSANvfp4Backend,
@@ -78,7 +77,10 @@ from vllm.v1.kv_cache_interface import (
     get_kv_quant_mode,
 )
 
+logger = init_logger(__name__)
+
 _FRAGMENT_PRODUCER_WARMED: set[tuple[int, ...]] = set()
+_ICP_EXCHANGE_SLOTS = 3
 
 
 def validate_icp_config(vllm_config: VllmConfig, config: PreTrainedConfig) -> None:
@@ -467,7 +469,6 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
         # context-parallel degree; `CompoundPageLayout` owns the geometry.
         self.tp_rank = get_tensor_model_parallel_rank()
         self.index_world_size = tp_size
-        self.main_format = SparseMainFormat.NVFP4
         physical_page_tokens = vllm_config.cache_config.block_size
         if sparse_cfg["sparse_block_size"] != 128:
             raise CompoundPageError("MiniMax sparse ranking requires B128")
@@ -478,7 +479,6 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
             )
         self.compound_layout = CompoundPageLayout.build(
             tp_size=tp_size,
-            main_format=self.main_format,
             ranking_block_tokens=sparse_cfg["sparse_block_size"],
             physical_page_tokens=physical_page_tokens,
             total_main_kv_heads=self.total_num_kv_heads,
@@ -535,9 +535,6 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
 
         if msa_api.ICP_DEVICE_PLAN_ABI_VERSION != ICP_DEVICE_PLAN_ABI:
             raise RuntimeError("msa_icp requires MSA device-plan ABI 3")
-        self._producer_kv_cache_dtype = (
-            "nvfp4" if self.main_format is SparseMainFormat.NVFP4 else "fp8_e4m3"
-        )
         self._warmup_sparse_producer()
 
         # Register the main K/V cache so the KV-cache manager allocates it.
@@ -778,7 +775,7 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
                 block_size=self.compound_layout.physical_page_tokens,
                 q_out=q,
                 index_q_out=index_q,
-                kv_cache_dtype=self._producer_kv_cache_dtype,
+                kv_cache_dtype="nvfp4",
                 q_fp8_out=query_fp8,
                 # A plain Python float that MUST be 1.0 -- the kernel is
                 # specialised to a unit Q scale and hard-checks it, so a checkpoint
@@ -868,22 +865,9 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
 def bind_model_candidate_exchange(self, vllm_config: VllmConfig) -> None:
     """Construct this process's one ICP candidate exchange and bind it.
 
-    Clause C1 shards the index store across ``W = TP`` ranks, so every
-    block score a sparse layer computes is a partial maximum and the
-    selection is only complete after the candidate merge. Until an exchange
-    is bound the layers refuse to serve (`_bound_compound_cache`), so this
-    is what makes ``W > 1`` startable at all.
-
-    All sparse layers share one exchange, separated by ``layer_idx``
-    (`sparse_layer_index`), which K5T turns into a slot as
-    ``layer_idx % slots``; `create_candidate_exchange` checks the slot-reuse
-    discipline against the participants counted here. At ``W == 1`` nothing
-    is constructed: this rank's partial maxima are already the true block
-    scores, and K5T's window cannot form a symmetric-memory group alone.
-
-    The process group is vLLM's existing TP group; the model contract fixes
-    ``TP == indexer CP == W`` and puts all K5T peers in it, with vLLM
-    supplying the group. TP/CP subgroups are an explicit non-goal.
+    Every sparse layer shares it, separated by ``sparse_layer_index``. Its
+    extents are both bands' admitted ladders, derived from the config alone so
+    every rank agrees; the merged ids land in the shared top-k buffer.
     """
     world_size = get_tensor_model_parallel_world_size()
     if world_size == 1:
@@ -895,22 +879,13 @@ def bind_model_candidate_exchange(self, vllm_config: VllmConfig) -> None:
     ]
     if not sparse_layers:
         return
-    buf = self.topk_indices_buffer
-    assert buf is not None
-    # The merged ids are written straight into the shared top-k buffer, so
-    # the exchange's output geometry IS that buffer's: T rows and this
-    # rank's H_local index heads. Read off it rather than recomputed, so
-    # the two cannot drift (the indexer asserts the same identity).
-    token_capacity, num_heads_local = buf.shape[0], buf.shape[1]
-    # The admitted exchange extents: both bands' ladders merged, because
-    # one instance serves both and validates the presented extent against a
-    # single admitted set. Merging cannot move either band's own selection;
-    # what it buys is one retained carrier workspace per rung of either
-    # ladder. Derived from the config alone (refined-icp-v1 C4: the shape
-    # must be fixed across ranks), and the indexer derives the same lists
-    # from the same functions, so the two cannot drift.
+    require_msa_icp()
+    from fmha_sm100.icp.candidate_exchange import CandidateExchange
     from fmha_sm100.icp.exchange_plan import admitted_exchange_extents
 
+    buf = self.topk_indices_buffer
+    assert buf is not None
+    token_capacity, num_heads_local = buf.shape[0], buf.shape[1]
     token_capacities = admitted_exchange_extents(
         max_token_capacity=vllm_config.scheduler_config.max_num_batched_tokens,
         cudagraph_capture_sizes=(
@@ -919,25 +894,32 @@ def bind_model_candidate_exchange(self, vllm_config: VllmConfig) -> None:
     )
     assert token_capacities[-1] == token_capacity, (
         f"the shared top-k buffer holds {token_capacity} rows but the "
-        f"largest admitted exchange extent is {token_capacities[-1]}; the "
-        "merged ids are written straight into that buffer, so its row "
-        "count is the global capacity."
+        f"largest admitted exchange extent is {token_capacities[-1]}"
     )
-    exchange = create_candidate_exchange(
+    rank = get_tensor_model_parallel_rank()
+    # Serving policy: D3 select/publish + network merge, PDL, three slots.
+    exchange = CandidateExchange(
         group=get_tp_group().device_group,
         world_size=world_size,
-        rank=get_tensor_model_parallel_rank(),
+        rank=rank,
         num_heads_local=num_heads_local,
-        # C7: every rank scores ALL of the group's index-query heads and
-        # routes head h to rank h // H_local, so the gathered head axis is
-        # rank-major and W * H_local wide.
+        # Every rank scores all W * H_local index heads (rank-major routing).
         num_index_heads=world_size * num_heads_local,
-        # The participants in the slot rotation, counted -- not assumed.
-        # A layer forced sparse outside the config's own set changes the
-        # count, and the slot-discipline check must see the real one.
         num_sparse_layers=len(sparse_layers),
         token_capacities=token_capacities,
         device=buf.device,
+        fused_decode=True,
+        use_pdl=True,
+        classic_merge=False,
+        slots=_ICP_EXCHANGE_SLOTS,
+    )
+    logger.info(
+        "MiniMax-M3 ICP candidate exchange: W=%d rank=%d layers=%d extents=%s %s",
+        world_size,
+        rank,
+        len(sparse_layers),
+        token_capacities,
+        exchange.decode_provenance,
     )
     self._icp_candidate_exchange = exchange
     for layer in sparse_layers:
