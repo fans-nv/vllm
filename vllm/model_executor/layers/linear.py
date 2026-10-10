@@ -1364,10 +1364,11 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
 
     ``index_q`` must have the same head count as the KV heads
     (``total_num_index_heads == total_num_kv_heads``) and ``index_head_size ==
-    head_size``. By default it shards like K/V, including KV-head replication
-    when ``tp_size > total_num_kv_heads``. With indexer context parallelism,
-    ``index_world_size`` consecutive TP ranks replicate index-Q heads and
-    shard only across groups. ``index_k`` is replicated to every rank.
+    head_size``, so it shards exactly like K/V -- including the KV-head
+    *replication* path when ``tp_size > total_num_kv_heads`` (this is what makes
+    a TP size greater than the KV-head count work). ``index_k`` is a single
+    shared head, replicated to every rank. With ``index_world_size`` W > 1,
+    index_q is replicated over W consecutive ranks and sharded across groups.
     """
 
     def __init__(
@@ -1386,6 +1387,8 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
         tp_rank: int | None = None,
         tp_size: int | None = None,
     ) -> None:
+        # index_q rides the KV-head sharding/replication path, so its head count
+        # must match the KV heads.
         assert total_num_index_heads == total_num_kv_heads, (
             "MinimaxM3QKVParallelLinearWithIndexer requires "
             "total_num_index_heads == total_num_kv_heads"
@@ -1398,11 +1401,7 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
         self.total_num_index_heads = total_num_index_heads
         self.index_head_size = index_head_size
 
-        if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
-        if index_world_size < 1:
-            raise ValueError("index_world_size must be positive")
-        self.index_world_size = index_world_size
+        tp_size = tp_size or get_tensor_model_parallel_world_size()
         self.num_heads = divide(self.total_num_heads, tp_size)
         if tp_size >= self.total_num_kv_heads:
             self.num_kv_heads = 1
@@ -1410,13 +1409,10 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
         else:
             self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
             self.num_kv_head_replicas = 1
-        index_shards = divide(tp_size, index_world_size)
-        if index_shards >= self.total_num_index_heads:
-            self.num_index_heads = 1
-            self.num_index_head_replicas = divide(tp_size, self.total_num_index_heads)
-        else:
-            self.num_index_heads = divide(self.total_num_index_heads, index_shards)
-            self.num_index_head_replicas = index_world_size
+        # index_q shards like the KV heads over tp_size / index_world_size groups.
+        shards = min(divide(tp_size, index_world_size), self.total_num_index_heads)
+        self.num_index_heads = divide(self.total_num_index_heads, shards)
+        self.num_index_head_replicas = divide(tp_size, shards)
 
         # Global per-group sizes (replicated groups counted x tp_size, matching
         # the QKVParallelLinear convention). index_k is a single replicated head.
@@ -1456,14 +1452,14 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
         )
 
     def _get_shard_offset_mapping(self, loaded_shard_id: str) -> int | None:
-        h, ih = self.head_size, self.index_head_size
+        h = self.head_size
         nq, nkv, nidx = self.num_heads, self.num_kv_heads, self.num_index_heads
         return {
             "q": 0,
             "k": nq * h,
             "v": (nq + nkv) * h,
             "index_q": (nq + 2 * nkv) * h,
-            "index_k": (nq + 2 * nkv) * h + nidx * ih,
+            "index_k": (nq + 2 * nkv + nidx) * h,
         }.get(loaded_shard_id)
 
     def _get_shard_size_mapping(self, loaded_shard_id: str) -> int | None:
@@ -1472,7 +1468,7 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
             "q": self.num_heads * h,
             "k": self.num_kv_heads * h,
             "v": self.num_kv_heads * h,
-            "index_q": self.num_index_heads * self.index_head_size,
+            "index_q": self.num_index_heads * h,
             "index_k": self.index_head_size,
         }.get(loaded_shard_id)
 
@@ -1495,13 +1491,13 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
                 weight_block_size, shard_size, shard_offset
             )
 
-        # The loader selects checkpoint rows using tp_rank // num_heads.
-        if loaded_shard_id == "index_k":
-            num_heads = self.tp_size
-        elif loaded_shard_id == "index_q":
-            num_heads = self.num_index_head_replicas
-        else:
-            num_heads = self.num_kv_head_replicas
+        # index_k is fully replicated: num_heads == tp_size makes
+        # load_qkv_weight pick shard_id_int == 0 on every rank. q/k/v ride the
+        # KV-head replication factor, index_q its own.
+        num_heads = {
+            "index_k": self.tp_size,
+            "index_q": self.num_index_head_replicas,
+        }.get(loaded_shard_id, self.num_kv_head_replicas)
         param.load_qkv_weight(
             loaded_weight=loaded_weight,
             num_heads=num_heads,

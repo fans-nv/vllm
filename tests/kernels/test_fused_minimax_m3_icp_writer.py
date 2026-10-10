@@ -10,7 +10,7 @@ rounding and NVFP4 arithmetic, without using another fused writer as an oracle.
 import pytest
 import torch
 
-from vllm import _custom_ops as ops
+import vllm._custom_ops  # noqa: F401 (registers the native op)
 from vllm.platforms import current_platform
 
 D, P, R, HQ, HKV, HI = 128, 128, 64, 32, 2, 4
@@ -53,6 +53,7 @@ def _case(n, dtype, rank, scales=(1.0, 1.0)):
         index_k_norm_weight=weights,
         num_index_heads=HI,
         slot_mapping=slots,
+        index_slot_mapping=None,
         kv_cache=main,
         index_cache=index,
         block_size=P,
@@ -135,7 +136,7 @@ def test_icp_owns_only_its_index_fragment_in_public_head_slots(n, rank, dtype, s
     index_bytes = torch.ones(D, device="cuda").to(torch.float8_e4m3fn).view(torch.uint8)
     addresses = offset + (owned // P) * stride + MAIN_BYTES + (owned % R) * D
     expected[addresses[:, None] + torch.arange(D, device="cuda")] = index_bytes
-    ops.fused_minimax_m3_qknorm_rope_kv_insert(**kwargs)
+    torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert(**kwargs)
     torch.testing.assert_close(storage, expected, rtol=0, atol=0)
     for name in ("q_out", "q_fp8_out", "index_q_out"):
         torch.testing.assert_close(
@@ -153,7 +154,7 @@ def test_icp_index_q_keeps_direct_fp32_rounding_and_both_main_q_outputs(dtype):
     # No caches: also exercise the profiling/warmup specialization.
     kwargs["kv_cache"] = kwargs["index_cache"] = None
     kwargs["kv_k_scale"] = kwargs["kv_v_scale"] = None
-    ops.fused_minimax_m3_qknorm_rope_kv_insert(**kwargs)
+    torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert(**kwargs)
     iq = kwargs["index_q_out"].view(2, HI, D).float()
     q = kwargs["q_out"].view(2, HQ, D).float()
     q8 = kwargs["q_fp8_out"].view(2, HQ, D).float()
@@ -167,7 +168,7 @@ def test_icp_direct_index_fp8_preserves_nan_class():
     kwargs["qkv"][0, 0] = float("nan")
     kwargs["qkv"][0, (HQ + 2 * HKV) * D] = float("nan")
     kwargs["qkv"][0, -D] = float("nan")
-    ops.fused_minimax_m3_qknorm_rope_kv_insert(**kwargs)
+    torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert(**kwargs)
     assert torch.isnan(kwargs["q_fp8_out"][0, :D].float()).all()
     assert torch.isnan(kwargs["index_q_out"][0, :D].float()).all()
     assert torch.isnan(kwargs["index_cache"][0, 0].float()).all()
@@ -188,7 +189,7 @@ def test_icp_native_admission_rejects_before_writing_cache(change, message):
     before = storage.clone()
     kwargs.update(change)
     with pytest.raises(RuntimeError, match=message):
-        ops.fused_minimax_m3_qknorm_rope_kv_insert(**kwargs)
+        torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert(**kwargs)
     torch.testing.assert_close(storage, before, rtol=0, atol=0)
 
 
@@ -216,5 +217,5 @@ def test_icp_rejects_misaligned_offset_views_before_any_store(name):
     shifted.copy_(value)
     kwargs[name] = shifted
     with pytest.raises(RuntimeError, match="aligned"):
-        ops.fused_minimax_m3_qknorm_rope_kv_insert(**kwargs)
+        torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert(**kwargs)
     torch.testing.assert_close(storage, before, rtol=0, atol=0)

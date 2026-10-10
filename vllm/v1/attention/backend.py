@@ -603,8 +603,8 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
     supports_update_block_table: bool = False
     # Whether the builder constructor requires the block-table width.
     requires_block_table_width: ClassVar[bool] = False
-    # Shape-compatible short prefills must not replay a phase-specific decode
-    # route. PIECEWISE graphs still dispatch attention outside the graph.
+    # Whether FULL decode graphs bake in a decode-only route, so a promoted
+    # prompt tail (a decode-shaped prefill row) must not replay them.
     cudagraph_decode_phase_only: ClassVar[bool] = False
     # Whether update_draft_decode_metadata() can regenerate all decode metadata
     # from persistent device buffers with capture-safe ops only. Lets a
