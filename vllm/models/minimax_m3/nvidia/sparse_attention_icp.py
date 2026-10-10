@@ -140,9 +140,7 @@ def validate_icp_config(vllm_config: VllmConfig, config: PreTrainedConfig) -> No
         raise ValueError("msa_icp does not support model-weight CPU offload")
     transfer = vllm_config.kv_transfer_config
     if transfer is not None:
-        # Compound pages must travel through the qualified whole-page CPU path.
-        # Check the direct connector, not has_connector(), which includes children
-        # of MultiConnector and cannot establish the child's buffer lifecycle.
+        # Only the qualified direct whole-page CPU connector, not MultiConnector.
         if (
             transfer.kv_connector != "SimpleCPUOffloadConnector"
             or transfer.kv_connector_module_path is not None
@@ -171,13 +169,7 @@ def uniform_decode_query_len(
     *,
     decode_only: bool,
 ) -> int:
-    """Per-request query length of the decode rows, which
-    ``split_decodes_and_prefills(require_uniform=True)`` keeps uniform.
-
-    ``decode_only`` (a decode-only step of a builder that avoids per-step host
-    work) takes it from ``max_query_len`` with no host tensor math; otherwise
-    it is read from, and checked against, the host query-start offsets.
-    """
+    """Uniform decode query length; host-checked unless the step is decode-only."""
     if decode_only:
         decode_query_len = common_attn_metadata.max_query_len
     else:
@@ -304,20 +296,8 @@ class MiniMaxM3SparseICPBackend(MiniMaxM3SparseMSANvfp4Backend):
 
 
 class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
-    """Block-sparse attention layer with the lightning-indexer branch.
+    """Sparse attention layer that owns the ICP compound cache and indexer."""
 
-    This is a merged attention layer: it owns the projections (qkv + index
-    q/k), per-head QK norms and RoPE, *and* the attention-backend wiring that a
-    generic ``Attention`` layer would normally provide. It owns the compound
-    KV cache and the compute-only lightning indexer (``MiniMaxM3Indexer``).
-
-    The index branch (index_{q,k}_proj + index_{q,k}_norm) feeds the sparse
-    top-k block selection. M3 always disables the index value/output
-    projections (``sparse_disable_index_value`` set for every sparse layer), so
-    ``index_{v,o}_proj`` are never created.
-    """
-
-    # Registered or assigned by set_default_quant_scales at construction.
     _q_scale: torch.Tensor
     _k_scale: torch.Tensor
     _k_scale_cpu: torch.Tensor
@@ -343,14 +323,7 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
         _assert_icp_prewarm(get_tensor_model_parallel_rank())
         self.hidden_size = config.hidden_size
         tp_size = get_tensor_model_parallel_world_size()
-        # The candidate exchange picks its transport slot as
-        # `sparse_layer_index % slots`, and its slot-discipline check is stated
-        # over the number of SPARSE layers -- so this is the ordinal within the
-        # sparse sweep, not the decoder layer id, which skips the dense layers
-        # and would let two consecutive sparse launches share one slot. A layer
-        # forced sparse outside the config's own set (the native MTP block) sits
-        # after that sweep, which is what makes the binder's layer count -- and
-        # therefore its slot-discipline check -- see it.
+        # Ordinal within the sparse sweep: the exchange slot is index % slots.
         sparse_layer_ids = sorted(_sparse_attention_layer_ids(config))
         if layer_id in sparse_layer_ids:
             self.sparse_layer_index = sparse_layer_ids.index(layer_id)
@@ -371,18 +344,11 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
-        # Sparse "index" branch dims.
         sparse_cfg = config.sparse_attention_config
         self.total_idx_heads = sparse_cfg["sparse_num_index_heads"]
         self.idx_head_dim = sparse_cfg["sparse_index_dim"]
 
-        # Single fused projection: q, k, v, index_q, index_k in one GEMM.
-        # W (= TP size, see `index_world_size` below) and the TP rank are
-        # passed explicitly because C7 replicates the index-Q head group across
-        # the W ICP ranks -- each rank scores all the group's index-query heads
-        # against its own R = 128/W key rows -- while q/k/v stay sharded over
-        # the full TP group. A defaulted W would silently narrow this rank's
-        # queries instead of failing.
+        # One fused GEMM; index-Q is replicated across the W ICP ranks.
         self.qkv_proj = MinimaxM3QKVParallelLinearWithIndexer(
             self.hidden_size,
             self.head_dim,
@@ -396,14 +362,10 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
             index_world_size=tp_size,
             tp_rank=get_tensor_model_parallel_rank(),
         )
-        # The projection is the single source of truth for the index-Q width:
-        # the `[num_tokens, index_q_size]` buffer below and the producer's
-        # `num_index_heads` must be exactly what the GEMM emits.
+        # The projection fixes the index-Q width the producer and buffers use.
         self.num_idx_heads = self.qkv_proj.num_index_heads
         self.index_q_size = self.num_idx_heads * self.idx_head_dim
-        # reduce_results=False: the attention all-reduce is fused with the
-        # following post_attention_layernorm (GemmaRMSNorm) in the decoder layer
-        # via fused_allreduce_gemma_rms_norm.
+        # The all-reduce is fused into the following post-attention norm.
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
@@ -444,16 +406,10 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
-        # MiniMax-M3 sparse attention owns its KV-cache insert/read path instead
-        # of wrapping the generic Attention module. Keep the same runtime scale
-        # attributes so FP8 KV reads can honor vLLM's per-layer descale contract.
+        # Runtime scale attributes honour vLLM's per-layer KV descale contract.
         self.calculate_kv_scales = False
         set_default_quant_scales(self, register_buffer=True)
-        # Index-key storage format (--attention-config '{"indexer_kv_dtype":
-        # ...}'). refined-icp-v1 fixes it at scale-free FP8 E4M3: the index
-        # region of a compound page is budgeted at exactly one byte per element
-        # with no scale payload, so a 2-byte bf16 key does not fit the page the
-        # KV-cache manager allocated.
+        # The compound page budgets one byte per index-key element (FP8 E4M3).
         self.indexer_kv_dtype = vllm_config.attention_config.indexer_kv_dtype
         if self.indexer_kv_dtype not in ("fp8", "fp8_e4m3"):
             raise CompoundPageError(
@@ -463,10 +419,7 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
                 'Pass --attention-config \'{"indexer_kv_dtype": "fp8"}\'.'
             )
 
-        # ---- compound KV page (refined-icp-v1 clause C1) -------------------
-        # One physical page per cache-config block carries this rank's main K/V
-        # and the index-key rows it owns. W (= TP size) is the indexer
-        # context-parallel degree; `CompoundPageLayout` owns the geometry.
+        # One page per block: this rank's main K/V plus the index rows it owns.
         self.tp_rank = get_tensor_model_parallel_rank()
         self.index_world_size = tp_size
         physical_page_tokens = vllm_config.cache_config.block_size
@@ -488,18 +441,10 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
         self.index_rows_per_rank = self.compound_layout.index_rows_per_rank
         # Bind non-owning main/index aliases once per cache lifetime.
         self._bound: BoundCompoundCache | None = None
-        # Transport seam. C1 shards the scoring as well as the store, so this
-        # rank's block scores are partial maxima; the true score is the maximum
-        # over the W ranks, resolved by merging 8-byte candidate records rather
-        # than by gathering keys. Local Top-16 per index head goes in, merged
-        # block ids come out. Until an exchange is bound, W > 1 is refused at
-        # bind time rather than selecting from partial scores alone. This layer
-        # implements no scoring, selection, merge or transport itself.
+        # Merges this rank's partial-max candidates; serving is refused until bound.
         self.candidate_exchange: Callable[[torch.Tensor], torch.Tensor] | None = None
 
-        # Shared top-k buffer: the indexer writes the selected blocks into it and
-        # the attend impl reads them back (so nothing crosses the eager break as a
-        # Python value, which would freeze at capture).
+        # Shared top-k buffer: nothing crosses the eager break as a Python value.
         self.topk_indices_buffer = topk_indices_buffer
         msa_decode_backend = vllm_config.attention_config.minimax_m3_msa_decode_backend
         # Admission requires the public CUTLASS selection for this ICP route.
@@ -514,10 +459,6 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
             sparse_block_size=sparse_cfg["sparse_block_size"],
             msa_decode_backend=msa_decode_backend,
         )
-        # Compute only: no side cache, no spec, no builder of its own. The
-        # bound index alias and the indexer sub-metadata this layer's own
-        # builder produced are handed in on every call.
-        # Fragment ownership is the (W, rank) this layer stores its rows with.
         self.indexer = MiniMaxM3IndexerMSAImpl(
             scale=self.scaling,
             num_index_heads=self.num_idx_heads,
@@ -528,8 +469,7 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
             icp_rank=self.tp_rank,
         )
 
-        # Resolve the compiled operator and cross-repository plan ABI before
-        # cache binding or graph capture. Both caches use this single writer.
+        # Resolve the writer and the MSA plan ABI before binding or capture.
         self._fused_indexer_kv_write = require_icp_writer()
         from fmha_sm100.icp.scorer.prefill import api as msa_api
 
@@ -601,30 +541,14 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
     def bind_candidate_exchange(
         self, exchange: "Callable[[torch.Tensor], torch.Tensor]"
     ) -> None:
-        """Bind the one candidate exchange for this sparse-layer invocation.
-
-        The explicit seam for the transport stream. It is handed this rank's
-        completed query-major local candidates ``[Qexchange, 4, 16, 2]`` -- 8
-        bytes per record, an fp32 score and an int32 global block id -- and must
-        return the merged selected ids ``[Qcapacity, Hlocal, 16]``, ascending
-        valid prefix then -1.
-
-        Exactly one exchange per invocation, after every bounded query chunk has
-        finished: NCCL for any invocation containing prefill, K5T/D3 without ACK
-        for pure decode and target verification. At ``W == 1`` no
-        exchange is needed because this rank's partial maxima are already the
-        true block scores.
-
-        Nothing here implements scoring, selection, merge or transport.
-        """
+        """Bind the model's one candidate exchange (called once per invocation)."""
         self.candidate_exchange = exchange
 
     def release_kv_cache(self) -> None:
         """Drop KV aliases after dependent graphs/streams have drained."""
         self._bound = None
         self.impl.release_kv_cache()
-        # The model-scoped peer window has an independent distributed lifetime.
-        # A temporary KV profiling pool must never close it on only one rank.
+        # The model-scoped exchange outlives a temporary profiling KV pool.
 
     def shutdown_model_resources(self) -> None:
         """Drop final model ownership without disturbing other live models."""
@@ -654,9 +578,7 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
         bound = self._bound
         if bound is None:
             raise CompoundPageError("ICP cache aliases must be bound before forward")
-        # Allocation-time binding validates the full storage signature. Keep
-        # only an object guard in the compiled producer path: data_ptr/storage
-        # inspection here would force a TorchDynamo graph break.
+        # Identity check only: storage inspection here would break the Dynamo graph.
         if bound.raw is not self.kv_cache:
             raise CompoundPageError(
                 "ICP cache identity changed during its live lifetime"
@@ -689,15 +611,7 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
         # Single fused projection emitting [q | k | v | index_q | index_k].
         qkv, _ = self.qkv_proj(hidden_states)
 
-        # Horizontally-fused per-head Gemma QK-norm + partial NeoX RoPE on the
-        # main (q/k) and index (index_q/index_k) branches, all read straight out
-        # of the single fused ``qkv`` tensor (the "5 results").  Once the paged
-        # caches are bound the kernel also inserts k/v and the index key into
-        # them; the initial memory-profiling run (caches unbound, no slot_mapping)
-        # short-circuits to zeros below. k/v and index_k are rewritten in place
-        # inside qkv (and scatter-inserted into the caches); q and index_q are
-        # de-interleaved
-        # straight into the dedicated contiguous ``q``/``index_q`` buffers below.
+        # The fused producer normalises, ropes and inserts K/V and the index key.
 
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         rotary_dim = self.rotary_emb.rotary_dim
@@ -712,23 +626,11 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
             # Memory-profiling run: caches not yet bound, slot_mapping is empty.
             return qkv.new_zeros((num_tokens, self.hidden_size))
 
-        # ONE slot map. Main K/V and the index rows share this layer's page, so
-        # they page identically: for a valid slot `s`, `page = s // B` and
-        # `u = s % B`; every rank writes its local main KV heads at `(page, u)`
-        # and the single rank `u // R` writes index row `u % R`.
+        # One slot map: rank u // R writes index row u % R of the shared page.
         slot_mapping = fwd_slot_mapping[self.layer_name]
         bound = self._bound_compound_cache()
         q = qkv.new_empty((num_tokens, self.q_size))
-        # CUDAGRAPH CAPTURE/REPLAY CONTRACT -- do NOT make this conditional on
-        # per-step metadata.  This allocation sits inside the captured region,
-        # while its consumer (`impl.forward`, reached through the
-        # `@eager_break_during_capture` on `_run_attention` below) runs in an
-        # eager break that is replayed with CAPTURE-TIME arguments while
-        # re-reading the LIVE forward context.  If `should_use_msa_decode`
-        # varied per step, a shape captured as "not CUTLASS" would bake in
-        # `query_fp8=None` and could still be routed to the CUTLASS branch at
-        # replay.  `should_use_msa_decode` is static by contract for exactly
-        # this reason -- see MiniMaxM3SparseImpl.should_use_msa_decode.
+        # Must not depend on per-step metadata: the eager break replays capture args.
         use_msa_decode = self.impl.should_use_msa_decode(self.layer_name)
         query_fp8 = (
             torch.empty(
@@ -739,19 +641,11 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
             if use_msa_decode
             else None
         )
-        # index_q carries the index-key storage dtype (scale-free FP8 E4M3);
-        # the fused producer emits fp8 directly into an e4m3 buffer.
         index_q = qkv.new_empty(
             (num_tokens, self.index_q_size),
             dtype=self.indexer.index_kv_torch_dtype,
         )
-        # One launch: Gemma QK-norm -> partial-NeoX RoPE -> bf16 Q + unscaled
-        # E4M3 Q -> index-Q -> this rank's index-K row -> packed NVFP4 main K/V.
-        # Named arguments bind the extended vLLM operator's ICP contract.
-        #
-        # `index_cache` is the 3-D fragment view `[num_pages, R, 128]`, whose
-        # `stride(0)` is the *compound* page stride and so spans the main
-        # region too. A 2-D flat cache is rejected outright.
+        # index_cache is [num_pages, R, 128] with the compound page stride.
         launch_icp_kv_write(
             self.layer_name,
             self.sparse_layer_index == 0,
@@ -777,18 +671,12 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
                 index_q_out=index_q,
                 kv_cache_dtype="nvfp4",
                 q_fp8_out=query_fp8,
-                # A plain Python float that MUST be 1.0 -- the kernel is
-                # specialised to a unit Q scale and hard-checks it, so a checkpoint
-                # carrying a real Q scale fails loudly instead of quantizing wrongly.
+                # Must be 1.0: the kernel is specialised to a unit Q scale.
                 q_fp8_scale=self._q_scale_float,
-                # 1-element fp32 CUDA tensors, not the `_float` scalars: reading a
-                # host scalar would be a D2H sync inside a captured region.
+                # Device scalars: a host read would sync inside the captured region.
                 kv_k_scale=self._k_scale,
                 kv_v_scale=self._v_scale,
-                # Fragment ownership (refined-icp-v1 C1). Explicit, never inferred:
-                # the index view's -2 dim is R, not B, so inferring B from it would
-                # divide the parent slot by R and put every page but the first in
-                # the wrong place, in bounds and silently.
+                # Explicit: inferring B from the R-row view misplaces pages.
                 index_block_tokens=self.compound_layout.physical_page_tokens,
                 index_rows_per_rank=self.index_rows_per_rank,
                 index_rank=self.tp_rank,
@@ -811,14 +699,7 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
         index_query: torch.Tensor,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        # Single eager break around both: their split-K kernels read per-request
-        # metadata and can't be captured into a cudagraph. The indexer writes its
-        # top-k into the shared ``topk_indices_buffer``; the attend reads it back.
-        #
-        # The indexer holds no cache and no metadata of its own: both come from
-        # this layer. ``attn_metadata`` has exactly one entry for this layer --
-        # there is no second key for an index cache, because there is no index
-        # cache.
+        # One eager break: both read per-request metadata and cannot be captured.
         bound = self._bound_compound_cache()
         attn_metadata = get_forward_context().attn_metadata
         index_md = None
@@ -829,13 +710,7 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
                     f"{self.layer_name}: ICP attention requires sparse metadata"
                 )
             index_md = layer_metadata.indexer
-        # This rank's own R-row fragment, not a gathered block: the scorer is
-        # fragment-aware and reconstructs global positions as
-        # `128*b + rank*R + j` from (icp_c, icp_rank). At W > 1 the block scores
-        # it produces are partial maxima, so the selection is only complete
-        # after `candidate_exchange` -- which the indexer calls exactly once,
-        # after every bounded query chunk. This layer still implements no
-        # scoring, selection, merge or transport.
+        # This rank's R-row fragment; selection completes after the one exchange.
         self.indexer(
             index_query,
             index_kv=bound.index,
@@ -843,16 +718,7 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
             layer_idx=self.sparse_layer_index,
             candidate_exchange=self.candidate_exchange,
         )
-        # No transport status is read here. A check that synchronises the
-        # device, copies a CUDA value into Python or waits on a CPU status gate
-        # is forbidden on the per-step submission path, and moving it out of
-        # graph capture does not satisfy that rule, so there is no step-boundary
-        # check, no deferred checker and no downstream consumer gate. Reported
-        # GPU/peer failures remain the existing CUDA/NCCL/worker handling's.
-        # The main impl reads the main *region*, never the raw compound page:
-        # past `main_span_bytes` lie this rank's index rows.
-        # The impl consumes this layer's cache/scale fields. This merged layer
-        # has a model-facing forward signature rather than Attention.forward.
+        # No transport status is read: no sync on the submission path.
         return self.impl.forward(
             cast(AttentionLayer, self),
             query,
