@@ -2054,6 +2054,25 @@ def test_uniform_type_spec_block_table_width_matches_layer_spec(
     assert uniform_spec.max_num_blocks_per_req(vllm_config, 1024) == expected_width
 
 
+def test_full_attention_merge_rejects_page_extending_subclass():
+    """A subclass that appends page bytes must not merge into a plain spec."""
+
+    class _ExtendedPageSpec(FullAttentionSpec):
+        @property
+        def unpadded_page_size_bytes(self) -> int:
+            return super().unpadded_page_size_bytes + 64
+
+    plain = new_kv_cache_spec(num_kv_heads=2)
+    extended = _ExtendedPageSpec(
+        block_size=plain.block_size,
+        num_kv_heads=plain.num_kv_heads,
+        head_size=plain.head_size,
+        dtype=plain.dtype,
+    )
+    with pytest.raises(AssertionError, match="share a page size"):
+        FullAttentionSpec.merge([plain, extended])
+
+
 def test_merge_kv_cache_spec():
     same_layer_specs = [
         new_kv_cache_spec(num_kv_heads=32),

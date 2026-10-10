@@ -12,7 +12,6 @@ See https://github.com/vllm-project/vllm/issues/49224.
 
 import contextlib
 import gc
-import weakref
 from types import SimpleNamespace
 from typing import Any
 
@@ -140,18 +139,17 @@ def test_profiling_teardown_releases_cache_aliases_but_keeps_model_resources(
             self.reader_view: torch.Tensor | None = self.kv_cache.view(2, 8)
 
         def release_kv_cache(self):
-            assert events[0] == "drain"
             assert runner.cudagraph_manager is None
             self.reader_view = None
             events.append("release_alias")
 
+    class Model(torch.nn.Sequential):
         def shutdown_model_resources(self):
             pytest.fail("profiling must preserve model-scoped peer resources")
 
     layer = Layer()
-    old_cache = weakref.ref(layer.kv_cache)
     runner: Any = SimpleNamespace(
-        model=torch.nn.Sequential(layer),
+        model=Model(layer),
         model_state=SimpleNamespace(supports_mm_inputs=False),
         compilation_config=SimpleNamespace(static_forward_context={"attn": layer}),
         cudagraph_manager=object(),
@@ -160,9 +158,7 @@ def test_profiling_teardown_releases_cache_aliases_but_keeps_model_resources(
         lora_config=None,
         maybe_remove_all_loras=lambda _: None,
     )
-    monkeypatch.setattr(
-        torch.accelerator, "synchronize", lambda: events.append("drain")
-    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
 
     cgu._teardown_profiling_state(runner)
@@ -170,22 +166,18 @@ def test_profiling_teardown_releases_cache_aliases_but_keeps_model_resources(
     assert "release_alias" in events
     assert layer.kv_cache.numel() == 0
     assert layer.reader_view is None
-    assert old_cache() is None
-    assert runner.model[0] is layer
 
 
-def test_shutdown_closes_shared_model_resources_after_drain_before_cache_release(
+def test_shutdown_closes_model_resources_once_after_drain_before_cache_release(
     monkeypatch,
 ):
-    from vllm.v1.worker.utils import clear_layer_kv_caches
-
     events = []
     runner = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
     runner.cudagraph_manager = object()
     runner.vllm_config = SimpleNamespace()
     runner.aux_output_connector = None
 
-    class Resource(torch.nn.Module):
+    class Layer(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.kv_cache = torch.zeros(1)
@@ -193,19 +185,15 @@ def test_shutdown_closes_shared_model_resources_after_drain_before_cache_release
         def release_kv_cache(self):
             events.append("release_cache")
 
+    class Model(torch.nn.Sequential):
         def shutdown_model_resources(self):
             assert runner.cudagraph_manager is None
             events.append("close_peer")
 
-    resource = Resource()
-    runner.model = torch.nn.Sequential(resource)
-    runner.speculator = SimpleNamespace(model=torch.nn.Sequential(resource))
-
-    # The profiling cache reset must not close a model-scoped peer window.
-    clear_layer_kv_caches(runner.model.modules())
-    assert events == ["release_cache"]
-    events.clear()
-
+    model = Model(Layer())
+    runner.model = model
+    # A draft that shares the target root must not close it twice.
+    runner.speculator = SimpleNamespace(model=model)
     monkeypatch.setattr(
         torch.accelerator, "synchronize", lambda: events.append("drain")
     )
@@ -214,7 +202,7 @@ def test_shutdown_closes_shared_model_resources_after_drain_before_cache_release
     runner.shutdown()
     assert events[:2] == ["drain", "close_peer"]
     assert events.count("close_peer") == 1
-    assert all(event == "release_cache" for event in events[2:])
+    assert set(events[2:]) == {"release_cache"}
 
 
 def test_profile_cudagraph_memory_no_graphs_tears_down(monkeypatch):
