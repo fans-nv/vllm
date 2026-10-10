@@ -42,9 +42,19 @@ class MiniMaxM3CompoundSpec(FullAttentionSpec):
         ):
             raise ValueError("MiniMax-M3 compound pages require TP2/P128 packed NVFP4")
 
+    # One raw [B, 1, 1, page] view: the layer binds main/index aliases itself.
     @property
-    def uses_raw_page_view(self) -> bool:
-        return True
+    def num_heads(self) -> int:
+        return 1
+
+    @property
+    def state_content_size_bytes(self) -> int:
+        return self.page_size_bytes
+
+    def get_num_kernel_states(self, kernel_block_size: int) -> int:
+        if kernel_block_size != self.block_size:
+            raise ValueError("Compound KV pages do not support kernel block splitting")
+        return 1
 
     @property
     def index_region_bytes(self) -> int:
@@ -52,7 +62,9 @@ class MiniMaxM3CompoundSpec(FullAttentionSpec):
 
     @property
     def unpadded_page_size_bytes(self) -> int:
-        return super().unpadded_page_size_bytes + self.index_region_bytes
+        assert self.num_head_slots is not None and self.state_content_bytes is not None
+        main = self.num_head_slots * self.block_size * self.state_content_bytes
+        return main + self.index_region_bytes
 
     @classmethod
     def from_main_spec(

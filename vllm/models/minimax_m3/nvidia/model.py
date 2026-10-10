@@ -1085,6 +1085,13 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
+    def shutdown_model_resources(self) -> None:
+        """Runner shutdown: close ICP peer resources before TP teardown."""
+        for module in self.modules():
+            close = getattr(module, "shutdown_model_resources", None)
+            if module is not self and callable(close):
+                close()
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_text_config
@@ -1224,6 +1231,9 @@ class MiniMaxM3SparseForConditionalGeneration(
     @property
     def lm_head(self) -> nn.Module:
         return self.language_model.lm_head
+
+    def shutdown_model_resources(self) -> None:
+        self.language_model.shutdown_model_resources()
 
     def _parse_and_validate_image_input(self, **kwargs: object) -> dict | None:
         pixel_values = kwargs.pop("pixel_values", None)

@@ -119,8 +119,6 @@ def test_msa_import_suppresses_global_ffi_registration_and_restores_environment(
 def test_compiled_writer_schema_requires_icp_and_plan_abi(
     monkeypatch, plan_abi, public_prefix
 ):
-    from vllm import _custom_ops as ops
-
     arguments = [
         SimpleNamespace(name=name, default_value=None)
         for name in (
@@ -147,10 +145,7 @@ def test_compiled_writer_schema_requires_icp_and_plan_abi(
         torch.ops._C, "fused_minimax_m3_qknorm_rope_kv_insert", native, raising=False
     )
     if plan_abi == 3 and public_prefix:
-        assert (
-            dependency.require_icp_writer()
-            is ops.fused_minimax_m3_qknorm_rope_kv_insert
-        )
+        assert dependency.require_icp_writer() is dependency.icp_kv_insert
     else:
         with pytest.raises(RuntimeError, match="Rebuild vLLM"):
             dependency.require_icp_writer()

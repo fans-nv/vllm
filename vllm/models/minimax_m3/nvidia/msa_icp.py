@@ -64,7 +64,7 @@ def require_icp_writer() -> Callable[..., None]:
     """Reject stale vLLM binaries before the compound cache is bound."""
     import torch
 
-    from vllm import _custom_ops as ops
+    from vllm import _custom_ops  # noqa: F401  (registers torch.ops._C)
 
     requirement = (
         "msa_icp requires vLLM's fused MiniMax-M3 writer with fragment, live "
@@ -95,7 +95,35 @@ def require_icp_writer() -> Callable[..., None]:
         arguments["icp_plan_abi"].default_value != ICP_DEVICE_PLAN_ABI
     ):
         raise RuntimeError(requirement)
-    return ops.fused_minimax_m3_qknorm_rope_kv_insert
+    return icp_kv_insert
+
+
+def icp_kv_insert(*, icp_device_plan=None, **kwargs) -> None:
+    """Launch the native writer with ICP arguments; mark the plan only on success."""
+    import torch
+
+    kwargs.setdefault("index_slot_mapping", None)
+    if kwargs.get("index_world_size") or kwargs.get("write_icp_metadata"):
+        kwargs.setdefault("icp_plan_abi", ICP_DEVICE_PLAN_ABI)
+    shape = None
+    if icp_device_plan is not None:
+        positions = kwargs.get("icp_positions")
+        if not kwargs.get("write_icp_metadata") or positions is None:
+            raise ValueError(
+                "icp_device_plan requires write_icp_metadata=True and icp_positions"
+            )
+        if icp_device_plan.abi_version != ICP_DEVICE_PLAN_ABI:
+            raise RuntimeError("MiniMax-M3 native writer requires device-plan ABI 3")
+        shape = dict(
+            chunk_width=kwargs.get("icp_chunk_width", 0),
+            num_rows=positions.numel(),
+            row_begin=kwargs.get("icp_plan_row_begin", 0),
+        )
+        icp_device_plan.check_writer_launch(**shape)
+        kwargs.update(icp_device_plan.writer_kwargs())
+    torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert(**kwargs)
+    if shape is not None:
+        icp_device_plan.note_writer_launch(**shape)
 
 
 @cache

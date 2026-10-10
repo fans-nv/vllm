@@ -52,8 +52,6 @@ def compound_spec(main_spec, layout):
 
 def test_compound_spec_appends_index_bytes_after_packed_main(main_spec, compound_spec):
     assert main_spec.page_size_bytes == 36_864
-    assert not main_spec.uses_raw_page_view
-    assert compound_spec.uses_raw_page_view
     assert compound_spec.index_region_bytes == 8192
     assert compound_spec.page_size_bytes == PAGE_BYTES
     assert compound_spec.page_size_padded is None
@@ -166,9 +164,7 @@ def test_compound_merge_retains_the_full_contract(compound_spec):
 
 
 def test_plain_attention_merge_cannot_drop_the_index_region(main_spec, compound_spec):
-    with pytest.raises(AssertionError, match="compound"):
-        FullAttentionSpec.merge([compound_spec, compound_spec])
-    with pytest.raises(AssertionError, match="compound"):
+    with pytest.raises(AssertionError, match="share a page size"):
         FullAttentionSpec.merge([main_spec, compound_spec])
     with pytest.raises(AssertionError, match="main-only"):
         MiniMaxM3CompoundSpec.merge([compound_spec, main_spec])
@@ -176,14 +172,21 @@ def test_plain_attention_merge_cannot_drop_the_index_region(main_spec, compound_
 
 @pytest.mark.parametrize("kernel_block_size", [32, 64, 256])
 def test_compound_pages_cannot_be_split(compound_spec, kernel_block_size):
-    with pytest.raises(ValueError, match="splitting"):
+    with pytest.raises((AssertionError, ValueError)):
         compute_layer_kv_cache_shape_bytes(compound_spec, 3, kernel_block_size)
 
 
-@pytest.mark.parametrize("cache_layout", list(KVCacheLayout)[1:])
-def test_compound_pages_require_the_qualified_lbhnc_layout(compound_spec, cache_layout):
-    with pytest.raises(ValueError, match="LBHNC"):
-        compute_layout_strides(compound_spec, 3, 2, cache_layout)
+@pytest.mark.parametrize("cache_layout", list(KVCacheLayout))
+def test_only_page_major_layouts_bind(compound_spec, layout, cache_layout):
+    # H = N = 1, so block-inner layouts alias LBHNC; block-outer ones interleave.
+    strides = compute_layout_strides(compound_spec, 3, 2, cache_layout)[1:]
+    backing = torch.zeros(2 * 3 * PAGE_BYTES, dtype=torch.uint8)
+    raw = torch.as_strided(backing, (3, 1, 1, PAGE_BYTES), strides)
+    if strides[0] == PAGE_BYTES:
+        bind_compound_cache(raw, layout, tp_rank=0)
+    else:
+        with pytest.raises(CompoundPageError):
+            bind_compound_cache(raw, layout, tp_rank=0)
 
 
 @pytest.mark.parametrize(

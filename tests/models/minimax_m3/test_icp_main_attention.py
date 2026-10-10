@@ -213,10 +213,14 @@ def test_main_decode_plan_uses_one_streamk_launch_and_reuses_schedule(monkeypatc
 
 
 def test_main_decode_plan_lifetime_follows_live_models_not_temporary_kv(monkeypatch):
+    from vllm.models.minimax_m3.nvidia.model import MiniMaxM3SparseForCausalLM
     from vllm.models.minimax_m3.nvidia.sparse_attention_icp import (
         MiniMaxM3SparseICPAttention,
     )
-    from vllm.v1.worker.gpu.shutdown import shutdown_model_resources
+
+    def shutdown_model_resources(roots):
+        for root in roots:
+            MiniMaxM3SparseForCausalLM.shutdown_model_resources(root)
 
     def init(plans, *_args):
         # Stand in for a native DecodePlan's owned device buffers.

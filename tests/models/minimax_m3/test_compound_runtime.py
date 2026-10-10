@@ -39,7 +39,7 @@ class _Builder:
     requires_block_table_width = False
 
     def __init__(self, spec, *_args, **_kwargs):
-        self.cudagraph_decode_phase_only = spec.uses_raw_page_view
+        self.cudagraph_decode_phase_only = isinstance(spec, MiniMaxM3CompoundSpec)
 
     def get_cudagraph_support(self, *_args):
         return AttentionCGSupport.UNIFORM_BATCH
@@ -136,7 +136,7 @@ def test_dense_draft_compound_group_keeps_raw_lifetime_and_attention(monkeypatch
         3 * bytes_per_block
     }
     layers = {
-        name: _Layer(layout if spec.uses_raw_page_view else None)
+        name: _Layer(layout if isinstance(spec, MiniMaxM3CompoundSpec) else None)
         for name, spec in specs.items()
     }
     monkeypatch.setattr(
@@ -153,7 +153,11 @@ def test_dense_draft_compound_group_keeps_raw_lifetime_and_attention(monkeypatch
     assert {name for group in attn_groups[0] for name in group.layer_names} == set(
         specs
     )
-    assert support.decode_phase_only
+    # The runner reads this builder flag to keep prefill out of FULL graphs.
+    assert any(
+        getattr(group.get_metadata_builder(0), "cudagraph_decode_phase_only", False)
+        for group in attn_groups[0]
+    )
     assert all(group.kv_cache_spec.uses_slot_mapping for group in attn_groups[0])
 
     caches = allocate_kv_cache(
