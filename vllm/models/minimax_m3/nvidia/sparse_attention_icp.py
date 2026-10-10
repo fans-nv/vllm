@@ -44,10 +44,8 @@ from vllm.models.minimax_m3.common.sparse_attention import (
     MiniMaxM3SparsePrefillMetadata,
 )
 from vllm.models.minimax_m3.nvidia.indexer_icp import (
-    ICP_PRODUCER_ENABLE_PDL,
-    MiniMaxM3IndexerMSAImpl,
+    MiniMaxM3IndexerMSAMetadata,
     MiniMaxM3IndexerMSAMetadataBuilder,
-    _assert_icp_prewarm,
 )
 from vllm.models.minimax_m3.nvidia.model import (
     MiniMAXGemmaRMSNorm,
@@ -55,6 +53,7 @@ from vllm.models.minimax_m3.nvidia.model import (
 )
 from vllm.models.minimax_m3.nvidia.msa_icp import (
     ICP_DEVICE_PLAN_ABI,
+    require_icp_prewarm,
     require_icp_writer,
     require_msa_icp,
 )
@@ -80,7 +79,8 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 _FRAGMENT_PRODUCER_WARMED: set[tuple[int, ...]] = set()
-_ICP_EXCHANGE_SLOTS = 3
+# The producer stays non-PDL: it is the barrier for the CuTe scorer's pre-wait reads.
+ICP_PRODUCER_ENABLE_PDL = False
 
 
 def validate_icp_config(vllm_config: VllmConfig, config: PreTrainedConfig) -> None:
@@ -320,7 +320,7 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
         super().__init__()
         validate_icp_config(get_current_vllm_config(), config)
         require_msa_icp()
-        _assert_icp_prewarm(get_tensor_model_parallel_rank())
+        require_icp_prewarm(get_tensor_model_parallel_rank())
         self.hidden_size = config.hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         # Ordinal within the sparse sweep: the exchange slot is index % slots.
@@ -459,15 +459,9 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
             sparse_block_size=sparse_cfg["sparse_block_size"],
             msa_decode_backend=msa_decode_backend,
         )
-        self.indexer = MiniMaxM3IndexerMSAImpl(
-            scale=self.scaling,
-            num_index_heads=self.num_idx_heads,
-            index_head_dim=self.idx_head_dim,
-            prefix=self.layer_name,
-            topk_indices_buffer=topk_indices_buffer,
-            icp_c=self.index_world_size,
-            icp_rank=self.tp_rank,
-        )
+        from fmha_sm100.icp.indexer_runtime import IcpIndexerRuntime
+
+        IcpIndexerRuntime.check_installed()
 
         # Resolve the writer and the MSA plan ABI before binding or capture.
         self._fused_indexer_kv_write = require_icp_writer()
@@ -523,7 +517,7 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
             index_q_out=torch.empty(
                 (1, self.index_q_size),
                 device=device,
-                dtype=self.indexer.index_kv_torch_dtype,
+                dtype=torch.float8_e4m3fn,
             ),
             q_fp8_out=torch.empty(
                 (1, self.q_size), device=device, dtype=torch.float8_e4m3fn
@@ -643,7 +637,7 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
         )
         index_q = qkv.new_empty(
             (num_tokens, self.index_q_size),
-            dtype=self.indexer.index_kv_torch_dtype,
+            dtype=torch.float8_e4m3fn,
         )
         # index_cache is [num_pages, R, 128] with the compound page stride.
         launch_icp_kv_write(
@@ -681,7 +675,6 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
                 index_rows_per_rank=self.index_rows_per_rank,
                 index_rank=self.tp_rank,
                 index_world_size=self.index_world_size,
-                # Must stay False while the CuTe scorer is PDL (see indexer_icp).
                 enable_pdl=ICP_PRODUCER_ENABLE_PDL,
             ),
         )
@@ -702,22 +695,23 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
         # One eager break: both read per-request metadata and cannot be captured.
         bound = self._bound_compound_cache()
         attn_metadata = get_forward_context().attn_metadata
-        index_md = None
         if isinstance(attn_metadata, dict):
             layer_metadata = attn_metadata[self.layer_name]
             if not isinstance(layer_metadata, MiniMaxM3SparseICPMetadata):
                 raise RuntimeError(
                     f"{self.layer_name}: ICP attention requires sparse metadata"
                 )
-            index_md = layer_metadata.indexer
-        # This rank's R-row fragment; selection completes after the one exchange.
-        self.indexer(
-            index_query,
-            index_kv=bound.index,
-            index_md=index_md,
-            layer_idx=self.sparse_layer_index,
-            candidate_exchange=self.candidate_exchange,
-        )
+            index_md = cast(MiniMaxM3IndexerMSAMetadata, layer_metadata.indexer)
+            # This rank's R-row fragment; selection completes after one exchange.
+            index_md.runtime.run_layer(
+                index_md.icp,
+                index_query,
+                bound.index,
+                layer_idx=self.sparse_layer_index,
+                exchange=self.candidate_exchange,
+                topk_buffer=self.topk_indices_buffer,
+                scale=self.scaling,
+            )
         # No transport status is read: no sync on the submission path.
         return self.impl.forward(
             cast(AttentionLayer, self),
@@ -747,44 +741,22 @@ def bind_model_candidate_exchange(self, vllm_config: VllmConfig) -> None:
         return
     require_msa_icp()
     from fmha_sm100.icp.candidate_exchange import CandidateExchange
-    from fmha_sm100.icp.exchange_plan import admitted_exchange_extents
 
-    buf = self.topk_indices_buffer
-    assert buf is not None
-    token_capacity, num_heads_local = buf.shape[0], buf.shape[1]
-    token_capacities = admitted_exchange_extents(
-        max_token_capacity=vllm_config.scheduler_config.max_num_batched_tokens,
+    # The serving policy is the factory default: D3, PDL, network merge.
+    exchange = CandidateExchange.for_tp_group(
+        group=get_tp_group().device_group,
+        world_size=world_size,
+        rank=get_tensor_model_parallel_rank(),
+        topk_buffer=self.topk_indices_buffer,
+        num_sparse_layers=len(sparse_layers),
+        max_num_batched_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
         cudagraph_capture_sizes=(
             vllm_config.compilation_config.cudagraph_capture_sizes or ()
         ),
     )
-    assert token_capacities[-1] == token_capacity, (
-        f"the shared top-k buffer holds {token_capacity} rows but the "
-        f"largest admitted exchange extent is {token_capacities[-1]}"
-    )
-    rank = get_tensor_model_parallel_rank()
-    # Serving policy: D3 select/publish + network merge, PDL, three slots.
-    exchange = CandidateExchange(
-        group=get_tp_group().device_group,
-        world_size=world_size,
-        rank=rank,
-        num_heads_local=num_heads_local,
-        # Every rank scores all W * H_local index heads (rank-major routing).
-        num_index_heads=world_size * num_heads_local,
-        num_sparse_layers=len(sparse_layers),
-        token_capacities=token_capacities,
-        device=buf.device,
-        fused_decode=True,
-        use_pdl=True,
-        classic_merge=False,
-        slots=_ICP_EXCHANGE_SLOTS,
-    )
     logger.info(
-        "MiniMax-M3 ICP candidate exchange: W=%d rank=%d layers=%d extents=%s %s",
-        world_size,
-        rank,
+        "MiniMax-M3 ICP candidate exchange: layers=%d %s",
         len(sparse_layers),
-        token_capacities,
         exchange.decode_provenance,
     )
     self._icp_candidate_exchange = exchange

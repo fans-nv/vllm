@@ -215,3 +215,112 @@ def test_actual_icp_builder_binds_q8kv4_decode_and_r13_prefill_csr(qsl):
     if md.num_decodes:
         assert md.decode.seq_lens._base is cm.seq_lens
         assert md.decode.block_table._base is cm.block_table_tensor
+
+
+def test_indexer_builder_hands_metadata_to_the_msa_runtime():
+    from vllm.models.minimax_m3.nvidia.indexer_icp import (
+        MiniMaxM3IndexerMSAMetadataBuilder,
+    )
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+
+    qsl = [0, 1, 2]
+    cm = CommonAttentionMetadata(
+        query_start_loc=torch.tensor(qsl, dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor(qsl, dtype=torch.int32),
+        seq_lens=torch.tensor([7, 9], dtype=torch.int32),
+        num_reqs=2,
+        num_actual_tokens=2,
+        max_query_len=1,
+        max_seq_len=9,
+        seq_lens_cpu_upper_bound=torch.tensor([7, 9], dtype=torch.int32),
+        block_table_tensor=torch.zeros(2, 8, dtype=torch.int32),
+        slot_mapping=torch.zeros(2, dtype=torch.int64),
+        positions=torch.zeros(2, dtype=torch.int64),
+        is_prefilling=torch.zeros(2, dtype=torch.bool),
+    )
+    live = SimpleNamespace(
+        **{
+            name: object()
+            for name in (
+                "positions",
+                "active",
+                "local_nvalid",
+                "local_forced",
+                "global_nvalid",
+                "forced",
+                "n_ordinary",
+                "candidates",
+                "qo_offsets",
+                "device_plan",
+            )
+        },
+        chunk_width=128,
+    )
+    step = SimpleNamespace(live=live)
+    seen = {}
+
+    def plan_step(**kwargs):
+        seen.update(kwargs)
+        return step
+
+    builder = object.__new__(MiniMaxM3IndexerMSAMetadataBuilder)
+    builder.reorder_batch_threshold = 4
+    builder.runtime = SimpleNamespace(plan_step=plan_step)
+    md = builder.build(0, cm)
+    assert seen["block_table"] is cm.block_table_tensor
+    assert seen["query_start_loc"] is cm.query_start_loc
+    assert seen["query_start_loc_cpu"] is cm.query_start_loc_cpu
+    assert seen["seq_lens"] is cm.seq_lens
+    assert seen["seq_lens_cpu_upper_bound"] is cm.seq_lens_cpu_upper_bound
+    assert seen["is_prefilling"] is cm.is_prefilling
+    assert (seen["num_reqs"], seen["num_tokens"]) == (2, 2)
+    assert md.icp is step and md.runtime is builder.runtime
+    assert (md.num_decodes, md.num_prefills, md.num_actual_tokens) == (2, 0, 2)
+    kwargs = md.live_metadata.writer_kwargs()
+    assert kwargs["icp_query_start_loc"] is cm.query_start_loc
+    assert kwargs["icp_seq_lens"] is cm.seq_lens and kwargs["icp_num_reqs"] == 2
+    assert kwargs["icp_candidates"] is live.candidates
+    assert kwargs["icp_device_plan"] is live.device_plan
+
+
+def test_attention_runs_the_layer_through_the_runtime(monkeypatch):
+    from vllm.models.minimax_m3.nvidia import msa_icp_main, sparse_attention_icp
+
+    calls: list = []
+    runtime = SimpleNamespace(
+        run_layer=lambda *args, **kwargs: calls.append(("index", args, kwargs))
+    )
+    index_md = SimpleNamespace(icp="step", runtime=runtime)
+    metadata = object.__new__(msa_icp_main.MiniMaxM3SparseICPMetadata)
+    metadata.indexer = index_md
+    bound = SimpleNamespace(index="index-fragment", main="main-region")
+
+    def attend(*args, **kwargs):
+        calls.append(("attend", args, kwargs))
+        return "out"
+
+    layer: Any = SimpleNamespace(
+        layer_name="sparse.0",
+        _bound_compound_cache=lambda: bound,
+        sparse_layer_index=5,
+        candidate_exchange="exchange",
+        topk_indices_buffer="topk",
+        scaling=0.5,
+        impl=SimpleNamespace(forward=attend),
+    )
+    monkeypatch.setattr(
+        sparse_attention_icp,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"sparse.0": metadata}),
+    )
+    q, q8, iq, out = (torch.empty(0) for _ in range(4))
+    result = sparse_attention_icp.MiniMaxM3SparseICPAttention._run_attention(
+        layer, q, q8, iq, out
+    )
+    assert result == "out"
+    (kind, args, kwargs), attend_call = calls
+    assert kind == "index" and args == ("step", iq, "index-fragment")
+    assert kwargs == dict(
+        layer_idx=5, exchange="exchange", topk_buffer="topk", scale=0.5
+    )
+    assert attend_call[0] == "attend" and attend_call[1][2] == "main-region"

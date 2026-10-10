@@ -18,3 +18,18 @@ def test_deployment_q4_rows_use_1024_eager_rung_above_capture512():
     assert select_token_capacity(capacities, 16_384) == 16_384
     with pytest.raises(ValueError, match="exceed"):
         select_token_capacity(capacities, 16_385)
+
+
+def test_live_metadata_hands_the_device_plan_to_the_writer():
+    from vllm.models.minimax_m3.nvidia.ops.icp_metadata import ICPLiveMetadata
+
+    store = object()
+    fields = dict.fromkeys(ICPLiveMetadata.__dataclass_fields__)
+    fields.update(num_reqs=1, chunk_width=128, device_plan=store)
+    kwargs = ICPLiveMetadata(**fields).writer_kwargs()
+    assert kwargs["icp_device_plan"] is store
+    assert kwargs["icp_plan_row_begin"] == 0
+    fields.update(device_plan=None)
+    kwargs = ICPLiveMetadata(**fields).writer_kwargs()
+    assert kwargs["icp_device_plan"] is None
+    assert kwargs["icp_plan_row_begin"] == 0

@@ -9,6 +9,10 @@ from functools import cache
 from threading import Lock
 from typing import Any
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 MSA_ICP_INTEGRATION_ABI = 1
 MSA_PUBLIC_VLLM_ABI = 1
 ICP_DEVICE_PLAN_ABI = 3
@@ -85,3 +89,20 @@ def require_icp_writer() -> Callable[..., None]:
     ):
         raise RuntimeError(requirement)
     return ops.fused_minimax_m3_qknorm_rope_kv_insert
+
+
+@cache
+def require_icp_prewarm(rank: int) -> None:
+    """Fail startup unless the writer is current and MSA's ICP cache is prewarmed."""
+    require_icp_writer()
+    try:
+        from fmha_sm100.icp import prewarm
+    except ImportError as exc:
+        raise RuntimeError(f"ICP prewarm verification is unavailable: {exc}") from exc
+    problems = prewarm.check()
+    if problems:
+        raise RuntimeError(
+            "ICP kernels are not fully prewarmed for this image; serving would "
+            f"JIT-compile: {problems}"
+        )
+    logger.info("ICP_PREWARM_VERIFIED rank=%d", rank)

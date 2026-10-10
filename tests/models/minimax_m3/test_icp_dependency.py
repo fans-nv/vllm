@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Reject missing or incompatible MSA ICP support before native setup."""
 
+import builtins
 import os
 import sys
 from types import ModuleType, SimpleNamespace
@@ -15,11 +16,16 @@ from vllm.models.minimax_m3.nvidia import msa_icp as dependency
 
 @pytest.fixture(autouse=True)
 def clear_admission_cache():
-    dependency.require_msa_icp.cache_clear()
-    dependency.require_icp_writer.cache_clear()
+    caches = (
+        dependency.require_msa_icp,
+        dependency.require_icp_writer,
+        dependency.require_icp_prewarm,
+    )
+    for fn in caches:
+        fn.cache_clear()
     yield
-    dependency.require_msa_icp.cache_clear()
-    dependency.require_icp_writer.cache_clear()
+    for fn in caches:
+        fn.cache_clear()
 
 
 def install_package(monkeypatch, abi=1, public_abi=1):
@@ -140,3 +146,42 @@ def test_compiled_writer_schema_requires_icp_and_plan_abi(
     else:
         with pytest.raises(RuntimeError, match="Rebuild vLLM"):
             dependency.require_icp_writer()
+
+
+@pytest.mark.parametrize("problems", [[], ["fmha: sources differ"]])
+def test_prewarm_startup_assertion(monkeypatch, problems):
+    monkeypatch.setattr(dependency, "require_icp_writer", lambda: None)
+    package: Any = ModuleType("fmha_sm100.icp")
+    prewarm: Any = ModuleType("fmha_sm100.icp.prewarm")
+    prewarm.check = lambda: list(problems)
+    package.prewarm = prewarm
+    monkeypatch.setitem(sys.modules, "fmha_sm100.icp", package)
+    monkeypatch.setitem(sys.modules, "fmha_sm100.icp.prewarm", prewarm)
+    if problems:
+        with pytest.raises(RuntimeError, match="not fully prewarmed"):
+            dependency.require_icp_prewarm(0)
+    else:
+        dependency.require_icp_prewarm(0)
+
+
+def test_missing_prewarm_verifier_fails_startup(monkeypatch):
+    monkeypatch.setattr(dependency, "require_icp_writer", lambda: None)
+    real_import = builtins.__import__
+
+    def import_without_verifier(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "fmha_sm100.icp" and "prewarm" in (fromlist or ()):
+            raise ImportError("No module named fmha_sm100.icp.prewarm")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_verifier)
+    with pytest.raises(RuntimeError, match="prewarm verification is unavailable"):
+        dependency.require_icp_prewarm(0)
+
+
+def test_prewarm_check_never_admits_a_stale_writer(monkeypatch):
+    def stale_writer():
+        raise RuntimeError("native writer lacks device-plan ABI 3")
+
+    monkeypatch.setattr(dependency, "require_icp_writer", stale_writer)
+    with pytest.raises(RuntimeError, match="native writer lacks"):
+        dependency.require_icp_prewarm(0)

@@ -21,8 +21,10 @@ def test_one_exchange_with_the_serving_policy_reaches_every_sparse_layer(
     class Recorder:
         decode_provenance: dict = {}
 
-        def __init__(self, **kwargs):
+        @classmethod
+        def for_tp_group(cls, **kwargs):
             seen.update(kwargs)
+            return cls()
 
     monkeypatch.setattr(owner, "CandidateExchange", Recorder)
     monkeypatch.setattr(icp_attn, "require_msa_icp", lambda: None)
@@ -53,13 +55,21 @@ def test_one_exchange_with_the_serving_policy_reaches_every_sparse_layer(
         compilation_config=SimpleNamespace(cudagraph_capture_sizes=[1, 4, 512]),
     )
     icp_attn.bind_model_candidate_exchange(model, config)
-    assert (seen["fused_decode"], seen["use_pdl"], seen["classic_merge"]) == (
-        True,
-        True,
-        False,
-    )
-    assert seen["slots"] == 3 and seen["num_sparse_layers"] == 3
+    # The serving policy (D3, PDL, network merge) is the factory default.
+    assert not {"fused_decode", "use_pdl", "classic_merge"} & set(seen)
+    assert seen["num_sparse_layers"] == 3
     assert (seen["world_size"], seen["rank"], seen["group"]) == (2, 1, "tp")
-    assert (seen["num_heads_local"], seen["num_index_heads"]) == (2, 4)
-    assert seen["token_capacities"][-1] == 16384
+    assert seen["topk_buffer"] is model.topk_indices_buffer
+    assert seen["max_num_batched_tokens"] == 16384
+    assert list(seen["cudagraph_capture_sizes"]) == [1, 4, 512]
     assert len(bound) == 3 and all(e is model._icp_candidate_exchange for e in bound)
+
+
+def test_factory_defaults_are_the_serving_policy():
+    owner = pytest.importorskip("fmha_sm100.icp.candidate_exchange")
+    import inspect
+
+    params = inspect.signature(owner.CandidateExchange.for_tp_group).parameters
+    assert params["fused_decode"].default is True
+    assert params["use_pdl"].default is True
+    assert params["classic_merge"].default is False
