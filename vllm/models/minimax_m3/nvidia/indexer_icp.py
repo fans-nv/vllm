@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import torch
+from torch import nn
 
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -24,16 +25,13 @@ from vllm.logger import init_logger
 from vllm.models.minimax_m3.common.compound_page import (
     INDEX_HEAD_DIM,
 )
-from vllm.models.minimax_m3.common.indexer_icp import (
-    MiniMaxM3IndexerBackend,
-    MiniMaxM3IndexerImpl,
+from vllm.models.minimax_m3.common.indexer import (
     MiniMaxM3IndexerMetadata,
     MiniMaxM3IndexerMetadataBuilder,
 )
 from vllm.models.minimax_m3.nvidia.msa_icp import require_icp_writer, require_msa_icp
 from vllm.models.minimax_m3.nvidia.ops.icp_metadata import ICPLiveMetadata
 from vllm.v1.attention.backend import (
-    AttentionBackend,
     AttentionCGSupport,
     CommonAttentionMetadata,
 )
@@ -480,14 +478,6 @@ def _msa_has_direct_table() -> bool:
     if not params.keys() >= _MSA_DIRECT_TABLE_PLAN_ARGS:
         return False
     return bool(getattr(api, "_FMHA_HAS_ICP_DIRECT_TABLE", False))
-
-
-class MiniMaxM3IndexerMSABackend(MiniMaxM3IndexerBackend):
-    """Indexer side-cache backend selecting the MSA builder."""
-
-    @staticmethod
-    def get_builder_cls() -> type["MiniMaxM3IndexerMSAMetadataBuilder"]:
-        return MiniMaxM3IndexerMSAMetadataBuilder
 
 
 @dataclass
@@ -2177,13 +2167,36 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
         )
 
 
-class MiniMaxM3IndexerMSAImpl(MiniMaxM3IndexerImpl):
-    """Score rank-local fragments, then select and exchange block candidates."""
+class MiniMaxM3IndexerMSAImpl(nn.Module):
+    """Score rank-local fragments, then select and exchange block candidates.
 
-    indexer_backend_cls: ClassVar[type[AttentionBackend]] = MiniMaxM3IndexerMSABackend
+    Compute only: the parent sparse layer owns the compound cache and hands in
+    this rank's index-key fragment, the sub-metadata and the shared top-k buffer.
+    """
 
-    def __init__(self, **kwargs) -> None:
-        super().__init__(**kwargs)
+    def __init__(
+        self,
+        *,
+        scale: float,
+        num_index_heads: int,
+        index_head_dim: int,
+        prefix: str,
+        topk_indices_buffer: torch.Tensor | None,
+        icp_c: int,
+        icp_rank: int,
+    ) -> None:
+        super().__init__()
+        if icp_c != 2 or icp_rank not in (0, 1):
+            raise ValueError("MiniMax M3 ICP requires two indexer ranks")
+        self.icp_c = icp_c
+        self.icp_rank = icp_rank
+        self.scale = scale
+        self.num_index_heads = num_index_heads
+        self.index_head_dim = index_head_dim
+        self.prefix = prefix
+        self.topk_indices_buffer = topk_indices_buffer
+        # Scale-free FP8 E4M3 index keys; also the dtype of index_q.
+        self.index_kv_torch_dtype = torch.float8_e4m3fn
         from fmha_sm100.icp.scorer.prefill import api  # noqa: PLC0415
 
         # The ICP score wave's output ABI. Version 1 signalled emptiness in band
@@ -2212,19 +2225,11 @@ class MiniMaxM3IndexerMSAImpl(MiniMaxM3IndexerImpl):
         *,
         index_kv: torch.Tensor,
         index_md: MiniMaxM3IndexerMetadata | None,
-        icp_c: int = 1,
-        icp_rank: int = 0,
         layer_idx: int = 0,
         candidate_exchange: Any = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if index_md is None:
             return None, None  # profiling run; caches unbound
-        assert (icp_c, icp_rank) == (self.icp_c, self.icp_rank), (
-            f"{self.prefix}: the fragment geometry this impl was built for "
-            f"(W={self.icp_c}, rank={self.icp_rank}) is not the one the layer "
-            f"passed (W={icp_c}, rank={icp_rank}); the plans, the page lists "
-            "and the head routing are all keyed on it."
-        )
         return self._forward_icp(
             index_query,
             index_kv=index_kv,

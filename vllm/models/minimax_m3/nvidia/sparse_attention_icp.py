@@ -37,7 +37,6 @@ from vllm.models.minimax_m3.common.compound_page import (
     compound_cache_identity,
 )
 from vllm.models.minimax_m3.common.compound_spec import MiniMaxM3CompoundSpec
-from vllm.models.minimax_m3.common.indexer_icp import MiniMaxM3Indexer
 from vllm.models.minimax_m3.common.ops.sparse_attn import SPARSE_BLOCK_SIZE
 from vllm.models.minimax_m3.common.sparse_attention import (
     MiniMaxM3SparseBackend,
@@ -46,6 +45,7 @@ from vllm.models.minimax_m3.common.sparse_attention import (
 )
 from vllm.models.minimax_m3.nvidia.indexer_icp import (
     ICP_PRODUCER_ENABLE_PDL,
+    MiniMaxM3IndexerMSAImpl,
     MiniMaxM3IndexerMSAMetadataBuilder,
     _assert_icp_prewarm,
 )
@@ -517,22 +517,13 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
         # Compute only: no side cache, no spec, no builder of its own. The
         # bound index alias and the indexer sub-metadata this layer's own
         # builder produced are handed in on every call.
-        self.indexer = MiniMaxM3Indexer(
-            num_kv_heads=self.num_kv_heads,
+        # Fragment ownership is the (W, rank) this layer stores its rows with.
+        self.indexer = MiniMaxM3IndexerMSAImpl(
             scale=self.scaling,
-            topk_blocks=sparse_cfg["sparse_topk_blocks"],
-            sparse_block_size=sparse_cfg["sparse_block_size"],
             num_index_heads=self.num_idx_heads,
             index_head_dim=self.idx_head_dim,
             prefix=self.layer_name,
-            init_blocks=sparse_cfg.get("sparse_init_block", 0),
-            local_blocks=sparse_cfg.get("sparse_local_block", 0),
-            score_type=sparse_cfg.get("sparse_score_type", "max"),
-            indexer_kv_dtype=self.indexer_kv_dtype,
             topk_indices_buffer=topk_indices_buffer,
-            # Fragment ownership, explicit and identical to the producer's: the
-            # indexer's score plans, page lists and head routing are keyed on
-            # it, so it must be the (W, rank) this layer stores its rows with.
             icp_c=self.index_world_size,
             icp_rank=self.tp_rank,
         )
@@ -852,8 +843,6 @@ class MiniMaxM3SparseICPAttention(nn.Module, AttentionLayerBase):
             index_query,
             index_kv=bound.index,
             index_md=index_md,
-            icp_c=self.index_world_size,
-            icp_rank=self.tp_rank,
             layer_idx=self.sparse_layer_index,
             candidate_exchange=self.candidate_exchange,
         )
