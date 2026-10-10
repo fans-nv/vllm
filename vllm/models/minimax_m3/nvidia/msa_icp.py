@@ -15,6 +15,7 @@ logger = init_logger(__name__)
 
 MSA_ICP_INTEGRATION_ABI = 1
 MSA_PUBLIC_VLLM_ABI = 1
+MSA_ICP_INDEXER_RUNTIME_ABI = 1
 ICP_DEVICE_PLAN_ABI = 3
 _msa_import_lock = Lock()
 
@@ -25,7 +26,8 @@ def require_msa_icp() -> Any:
     requirement = (
         "msa_icp requires fmha_sm100.icp with "
         f"ICP_INTEGRATION_ABI={MSA_ICP_INTEGRATION_ABI} and "
-        f"PUBLIC_VLLM_ABI={MSA_PUBLIC_VLLM_ABI}. "
+        f"PUBLIC_VLLM_ABI={MSA_PUBLIC_VLLM_ABI} and "
+        f"ICP_INDEXER_RUNTIME_ABI={MSA_ICP_INDEXER_RUNTIME_ABI}. "
         "Install the MSA build described in requirements/minimax_m3_icp.txt."
     )
     try:
@@ -49,6 +51,11 @@ def require_msa_icp() -> Any:
     public_abi = getattr(package, "PUBLIC_VLLM_ABI", None)
     if type(public_abi) is not int or public_abi != MSA_PUBLIC_VLLM_ABI:
         raise RuntimeError(f"{requirement} Found PUBLIC_VLLM_ABI={public_abi!r}.")
+    runtime_abi = getattr(package, "ICP_INDEXER_RUNTIME_ABI", None)
+    if type(runtime_abi) is not int or runtime_abi != MSA_ICP_INDEXER_RUNTIME_ABI:
+        raise RuntimeError(
+            f"{requirement} Found ICP_INDEXER_RUNTIME_ABI={runtime_abi!r}."
+        )
     return package
 
 

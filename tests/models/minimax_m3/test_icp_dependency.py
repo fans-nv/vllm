@@ -28,10 +28,11 @@ def clear_admission_cache():
         fn.cache_clear()
 
 
-def install_package(monkeypatch, abi=1, public_abi=1):
+def install_package(monkeypatch, abi=1, public_abi=1, runtime_abi=1):
     package: Any = ModuleType("fmha_sm100.icp")
     package.ICP_INTEGRATION_ABI = abi
     package.PUBLIC_VLLM_ABI = public_abi
+    package.ICP_INDEXER_RUNTIME_ABI = runtime_abi
     monkeypatch.setitem(sys.modules, "fmha_sm100.icp", package)
     return package
 
@@ -70,6 +71,13 @@ def test_failed_admission_is_not_cached(monkeypatch):
         dependency.require_msa_icp()
     package = install_package(monkeypatch)
     assert dependency.require_msa_icp() is package
+
+
+@pytest.mark.parametrize("runtime_abi", [None, 0, 2, "1", True])
+def test_package_without_the_indexer_runtime_is_rejected(monkeypatch, runtime_abi):
+    install_package(monkeypatch, runtime_abi=runtime_abi)
+    with pytest.raises(RuntimeError, match="ICP_INDEXER_RUNTIME_ABI"):
+        dependency.require_msa_icp()
 
 
 @pytest.mark.parametrize("public_abi", [None, 0, 2, "1", True])
