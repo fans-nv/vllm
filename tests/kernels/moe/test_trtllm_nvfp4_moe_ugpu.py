@@ -350,7 +350,7 @@ def _make_experts(monkeypatch, experts_cls, localization=None, deferred=False, *
     monkeypatch.setattr(
         FusedMoEConfig,
         "use_deferred_moe_finalize",
-        property(lambda self: self.defer_moe_finalize),
+        property(lambda self: self._defer_moe_finalize),
     )
     moe_config = _moe_config(
         e,
@@ -359,8 +359,9 @@ def _make_experts(monkeypatch, experts_cls, localization=None, deferred=False, *
         max_num_tokens=8192,
         swiglu_alpha=1.702,
         swiglu_beta=1.0,
-        defer_moe_finalize=deferred,
     )
+    if deferred:
+        moe_config.defer_moe_finalize()
     moe_config.intermediate_size_per_partition = 1536
     ones = torch.ones(e, device=device)
     no_scale = torch.zeros(1, dtype=torch.uint8)
@@ -660,7 +661,7 @@ def test_autotune_warmup_tunes_localized_op(monkeypatch, tmp_path, localized):
     tuning = {"on": False}
 
     @contextlib.contextmanager
-    def autotune(tune_mode=True, skip_ops=None, tuning_buckets=None):
+    def autotune(tune_mode=True, **kwargs):
         tuning["on"] = tune_mode
         yield
         tuning["on"] = False
@@ -671,6 +672,9 @@ def test_autotune_warmup_tunes_localized_op(monkeypatch, tmp_path, localized):
     fake_autotuner.set_autotune_process_group = lambda group: None
     monkeypatch.setitem(sys.modules, "flashinfer.autotuner", fake_autotuner)
     monkeypatch.setattr(fi_utils, "autotune", autotune)
+    monkeypatch.setattr(
+        fi_utils, "flashinfer_get_hybrid_num_tokens_buckets", lambda n: (n,)
+    )
     world = SimpleNamespace(
         rank_in_group=0,
         world_size=1,
@@ -679,6 +683,7 @@ def test_autotune_warmup_tunes_localized_op(monkeypatch, tmp_path, localized):
         barrier=lambda: None,
     )
     monkeypatch.setattr(parallel_state, "get_world_group", lambda: world)
+    monkeypatch.setattr(parallel_state, "get_pp_group", lambda: world)
     monkeypatch.setattr(
         kernel_warmup, "resolve_flashinfer_autotune_file", lambda r: tmp_path / "a"
     )
@@ -698,6 +703,7 @@ def test_autotune_warmup_tunes_localized_op(monkeypatch, tmp_path, localized):
             attention_config=SimpleNamespace(hisparse_config=None),
             cache_config=SimpleNamespace(use_replayssm=False),
             kernel_config=SimpleNamespace(linear_backend="auto"),
+            parallel_config=SimpleNamespace(data_parallel_rank=0),
         ),
         get_model=lambda: torch.nn.Module(),
         _dummy_run=run,
