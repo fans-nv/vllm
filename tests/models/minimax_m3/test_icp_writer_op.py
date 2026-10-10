@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from vllm.models.minimax_m3.nvidia.msa_icp import icp_kv_insert
+from vllm.models.minimax_m3.nvidia.msa_icp import _WRITER_DEFAULTS, icp_kv_insert
 
 
 @pytest.fixture
@@ -120,9 +120,16 @@ def test_non_owner_layers_pass_the_plan_abi_without_a_plan(launch):
     icp_kv_insert(index_world_size=2, enable_pdl=False)
     assert launch == [
         dict(
+            _WRITER_DEFAULTS,
             index_world_size=2,
             enable_pdl=False,
-            index_slot_mapping=None,
             icp_plan_abi=3,
         )
     ]
+
+
+def test_writer_defaults_cover_every_schema_argument_without_a_default():
+    # Warmup omits kv_cache/index_cache; the raw op rejects missing arguments.
+    assert {"kv_cache", "index_cache", "block_size", "kv_cache_dtype"} <= set(
+        _WRITER_DEFAULTS
+    )

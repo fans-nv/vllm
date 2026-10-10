@@ -98,11 +98,33 @@ def require_icp_writer() -> Callable[..., None]:
     return icp_kv_insert
 
 
+# The raw op has no defaults; these match the removed _custom_ops wrapper.
+_WRITER_DEFAULTS = dict(
+    index_q_norm_weight=None,
+    index_k_norm_weight=None,
+    num_index_heads=0,
+    slot_mapping=None,
+    index_slot_mapping=None,
+    kv_cache=None,
+    index_cache=None,
+    block_size=0,
+    q_out=None,
+    index_q_out=None,
+    kv_cache_dtype="auto",
+    skip_index_branch=False,
+    q_fp8_out=None,
+    q_fp8_scale=1.0,
+    kv_k_scale=None,
+    kv_v_scale=None,
+)
+
+
 def icp_kv_insert(*, icp_device_plan=None, **kwargs) -> None:
     """Launch the native writer with ICP arguments; mark the plan only on success."""
     import torch
 
-    kwargs.setdefault("index_slot_mapping", None)
+    for name, value in _WRITER_DEFAULTS.items():
+        kwargs.setdefault(name, value)
     if kwargs.get("index_world_size") or kwargs.get("write_icp_metadata"):
         kwargs.setdefault("icp_plan_abi", ICP_DEVICE_PLAN_ABI)
     shape = None
