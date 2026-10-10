@@ -64,10 +64,7 @@ from vllm.models.minimax_m3.nvidia.msa_icp_main import (
     MiniMaxM3SparseICPMetadata,
     get_icp_main_decode_plans,
 )
-from vllm.models.minimax_m3.nvidia.ops.icp_dispatch import (
-    admitted_exchange_extents,
-    create_candidate_exchange,
-)
+from vllm.models.minimax_m3.nvidia.ops.icp_dispatch import create_candidate_exchange
 from vllm.models.minimax_m3.nvidia.ops.icp_metadata import launch_icp_kv_write
 from vllm.models.minimax_m3.nvidia.sparse_attention_msa import (
     MiniMaxM3SparseMSANvfp4Backend,
@@ -923,6 +920,8 @@ def bind_model_candidate_exchange(self, vllm_config: VllmConfig) -> None:
     # ladder. Derived from the config alone (refined-icp-v1 C4: the shape
     # must be fixed across ranks), and the indexer derives the same lists
     # from the same functions, so the two cannot drift.
+    from fmha_sm100.icp.exchange_plan import admitted_exchange_extents
+
     token_capacities = admitted_exchange_extents(
         max_token_capacity=vllm_config.scheduler_config.max_num_batched_tokens,
         cudagraph_capture_sizes=(

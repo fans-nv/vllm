@@ -11,7 +11,7 @@ Native msa_icp imports stay lazy so this module is import-safe without it.
 import functools
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import Any, ClassVar
 
 import torch
 
@@ -31,21 +31,6 @@ from vllm.models.minimax_m3.common.indexer_icp import (
     MiniMaxM3IndexerMetadataBuilder,
 )
 from vllm.models.minimax_m3.nvidia.msa_icp import require_icp_writer, require_msa_icp
-from vllm.models.minimax_m3.nvidia.ops.icp_dispatch import (
-    CAND_K as _DISPATCH_CAND_K,
-)
-from vllm.models.minimax_m3.nvidia.ops.icp_dispatch import (
-    FUSED_DECODE_ENV,
-    ICP_PREFILL_EXTENT_STEPS_PER_OCTAVE,
-    admitted_exchange_extents,
-    exchange_token_capacities,
-    fused_decode_requested,
-    prefill_exchange_token_capacities,
-    select_token_capacity,
-)
-from vllm.models.minimax_m3.nvidia.ops.icp_dispatch import (
-    QCAPACITY_ALIGNMENT as _DISPATCH_QCAPACITY_ALIGNMENT,
-)
 from vllm.models.minimax_m3.nvidia.ops.icp_metadata import ICPLiveMetadata
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -54,9 +39,6 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec
-
-if TYPE_CHECKING:
-    from fmha_sm100.icp.local_indexer import ICPRowWindow
 
 logger = init_logger(__name__)
 
@@ -158,13 +140,6 @@ ICP_PREFILL_SCORE_SCRATCH_BUDGET_BYTES = 1024 * 1024 * 1024
 # scheduler's token budget. r13's fixed ceiling.
 ICP_MAX_PREFILL_WAVE_TOKENS = 16384
 
-# `auto` (default): resolve the wave per invocation from the admitted live
-# column extent, as above. An integer pins ONE wave width at FULL capacity
-# columns. Pinning is a measurement control for the profiling lane, not a
-# serving mode.
-_PREFILL_WAVE_ENV = "VLLM_MINIMAX_ICP_PREFILL_WAVE"
-# Override for :data:`ICP_PREFILL_SCORE_SCRATCH_BUDGET_BYTES`, in MiB.
-_PREFILL_SCORE_MIB_ENV = "VLLM_MINIMAX_ICP_PREFILL_SCORE_MIB"
 # Greppable startup markers for the resolved wave ladder and for the eager
 # prefill exchange-extent ladder. They are separate quantities -- query rows per
 # scorer launch versus candidate rows per selector call and per exchange -- and
@@ -173,85 +148,6 @@ _PREFILL_SCORE_MIB_ENV = "VLLM_MINIMAX_ICP_PREFILL_SCORE_MIB"
 # is emitted may change.
 _ICP_PREFILL_WAVE_MARKER = "ICP_PREFILL_WAVE_SCHEMA"
 _ICP_PREFILL_EXTENT_MARKER = "ICP_PREFILL_EXTENT_SCHEMA"
-
-
-def _icp_wave_from_budget(
-    *,
-    columns: int,
-    heads_group: int,
-    token_capacity: int,
-    budget_bytes: int,
-    max_wave: int,
-) -> int:
-    from fmha_sm100.icp.local_indexer import _icp_wave_from_budget as wave_from_budget
-
-    return wave_from_budget(
-        columns=columns,
-        heads_group=heads_group,
-        token_capacity=token_capacity,
-        budget_bytes=budget_bytes,
-        max_wave=max_wave,
-        query_tile_tokens=ICP_MSA_QUERY_TILE_TOKENS,
-    )
-
-
-def icp_prefill_column_rungs(
-    max_blocks: int,
-    *,
-    floor: int | None = None,
-    steps_per_octave: int | None = None,
-) -> tuple[int, ...]:
-    from fmha_sm100.icp.local_indexer import icp_prefill_column_rungs as column_rungs
-
-    if floor is None:
-        floor = ICP_PREFILL_COLUMN_FLOOR
-    if steps_per_octave is None:
-        steps_per_octave = ICP_PREFILL_COLUMN_STEPS_PER_OCTAVE
-    return column_rungs(max_blocks, floor=floor, steps_per_octave=steps_per_octave)
-
-
-def _prefill_wave_override() -> int | None:
-    """The pinned prefill wave, or ``None`` for the derived ladder."""
-    import os  # noqa: PLC0415
-
-    raw = os.environ.get(_PREFILL_WAVE_ENV, "auto").strip().lower()
-    if raw in ("", "auto"):
-        return None
-    try:
-        wave = int(raw)
-    except ValueError:
-        raise ValueError(
-            f"{_PREFILL_WAVE_ENV}={raw!r} must be `auto` or an integer number "
-            "of query rows"
-        ) from None
-    tile = ICP_MSA_QUERY_TILE_TOKENS
-    if wave < tile or wave % tile or wave > ICP_MAX_PREFILL_WAVE_TOKENS:
-        raise ValueError(
-            f"{_PREFILL_WAVE_ENV}={wave} must be a multiple of the inner MSA "
-            f"tile {tile} in [{tile}, {ICP_MAX_PREFILL_WAVE_TOKENS}]. The inner "
-            "tile is pinned by `_qo_tile_size_for` at icp_c > 1 and a wave that "
-            "is not a whole number of tiles would leave a partial tile in the "
-            "last plan."
-        )
-    return wave
-
-
-def _prefill_score_budget_bytes() -> int:
-    """Prefill score + validity arena bytes, from the env or the constant."""
-    import os  # noqa: PLC0415
-
-    raw = os.environ.get(_PREFILL_SCORE_MIB_ENV, "").strip()
-    if not raw:
-        return ICP_PREFILL_SCORE_SCRATCH_BUDGET_BYTES
-    try:
-        mib = int(raw)
-    except ValueError:
-        raise ValueError(
-            f"{_PREFILL_SCORE_MIB_ENV}={raw!r} must be an integer MiB count"
-        ) from None
-    if mib < 1:
-        raise ValueError(f"{_PREFILL_SCORE_MIB_ENV}={mib} must be >= 1 MiB")
-    return mib * 1024 * 1024
 
 
 def _icp_allocate_score_planes(
@@ -300,237 +196,20 @@ def _icp_allocate_score_planes(
             "closes, so it comes out of the headroom between "
             "gpu_memory_utilization and 100% and not out of the KV pool: lower "
             "--gpu-memory-utilization, --max-num-batched-tokens or "
-            f"--max-model-len, or lower the budget with {_PREFILL_SCORE_MIB_ENV}"
-            " -- which BUYS FEWER one-launch columns and is a deliberate "
-            "performance decision, not a workaround. Failing here is "
-            "deliberate: a wave that silently collapses to one 128-row inner "
-            "tile is the defect this replaces."
+            "--max-model-len."
         ) from exc
     return scores, valid
-
-
-def icp_outer_chunk_tokens(
-    *,
-    max_model_len: int,
-    heads_group: int,
-    token_capacity: int,
-    physical_page_tokens: int = PAGE_SIZE,
-    budget_bytes: int | None = None,
-    max_chunk: int | None = None,
-) -> int:
-    from fmha_sm100.icp.local_indexer import icp_outer_chunk_tokens as outer_chunk
-
-    if budget_bytes is None:
-        budget_bytes = ICP_SCORE_SCRATCH_BUDGET_BYTES
-    if max_chunk is None:
-        max_chunk = ICP_MAX_OUTER_CHUNK_TOKENS
-    return outer_chunk(
-        max_model_len=max_model_len,
-        heads_group=heads_group,
-        token_capacity=token_capacity,
-        physical_page_tokens=physical_page_tokens,
-        budget_bytes=budget_bytes,
-        max_chunk=max_chunk,
-        query_tile_tokens=ICP_MSA_QUERY_TILE_TOKENS,
-    )
-
-
-def icp_decode_chunk_tokens(
-    *,
-    max_model_len: int,
-    heads_group: int,
-    token_capacity: int,
-    physical_page_tokens: int = PAGE_SIZE,
-) -> int:
-    from fmha_sm100.icp.local_indexer import icp_decode_chunk_tokens as decode_chunk
-
-    return decode_chunk(
-        max_model_len=max_model_len,
-        heads_group=heads_group,
-        token_capacity=token_capacity,
-        physical_page_tokens=physical_page_tokens,
-        budget_bytes=ICP_SCORE_SCRATCH_BUDGET_BYTES,
-        max_chunk=ICP_MAX_OUTER_CHUNK_TOKENS,
-        query_tile_tokens=ICP_MSA_QUERY_TILE_TOKENS,
-    )
-
-
-def icp_prefill_wave_ladder(
-    columns: tuple[int, ...],
-    *,
-    heads_group: int,
-    token_capacity: int,
-    budget_bytes: int,
-) -> dict[int, int]:
-    from fmha_sm100.icp.local_indexer import icp_prefill_wave_ladder as wave_ladder
-
-    return wave_ladder(
-        columns,
-        heads_group=heads_group,
-        token_capacity=token_capacity,
-        budget_bytes=budget_bytes,
-        max_wave=ICP_MAX_PREFILL_WAVE_TOKENS,
-        query_tile_tokens=ICP_MSA_QUERY_TILE_TOKENS,
-    )
-
-
-def icp_prefill_rung(columns: tuple[int, ...], live_blocks: int) -> int:
-    from fmha_sm100.icp.local_indexer import icp_prefill_rung as prefill_rung
-
-    return prefill_rung(columns, live_blocks)
-
-
-def icp_prefill_arena_elems(waves: dict[int, int], heads_group: int) -> int:
-    from fmha_sm100.icp.local_indexer import icp_prefill_arena_elems as arena_elems
-
-    return arena_elems(waves, heads_group)
-
-
-# ---- CuTe decode scorer windows ---------------------------------------------
-# MSA's launch ABI 2 takes the token window and request range as runtime launch
-# scalars, so one compile per query length serves every window. The window is
-# the band's rows from the chunk origin, which under a FULL graph is the PADDED
-# extent (`num_actual_tokens`) and so a constant of the graph; the request range
-# is the requests those rows can belong to, capped at the metadata's own
-# request count, so it never names a slot the runner's views do not hold.
-
-
-def icp_cute_decode_window(
-    *, query_len: int, token_begin: int, rows: int, chunk: int, num_reqs: int
-) -> tuple[int, int, int, int] | None:
-    from fmha_sm100.icp.local_indexer import icp_cute_decode_window as decode_window
-
-    return decode_window(
-        query_len=query_len,
-        token_begin=token_begin,
-        rows=rows,
-        chunk=chunk,
-        num_reqs=num_reqs,
-    )
-
-
-def __getattr__(name: str):
-    if name == "ICPRowWindow":
-        from fmha_sm100.icp.local_indexer import ICPRowWindow
-
-        return ICPRowWindow
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-def icp_row_windows(
-    *,
-    num_tokens: int,
-    cap: int,
-    cute_rows: int,
-    decode_chunk: int,
-    prefill_width: int,
-    has_prefill: bool,
-) -> list["ICPRowWindow"]:
-    from fmha_sm100.icp.local_indexer import icp_row_windows as row_windows
-
-    return row_windows(
-        num_tokens=num_tokens,
-        cap=cap,
-        cute_rows=cute_rows,
-        decode_chunk=decode_chunk,
-        prefill_width=prefill_width,
-        has_prefill=has_prefill,
-    )
-
-
-def _bind_cute_launch(
-    scorer,
-    block_table: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    seq_lens: torch.Tensor,
-    positions: torch.Tensor,
-    active_rows: torch.Tensor,
-    scores: torch.Tensor,
-    valid: torch.Tensor,
-) -> Callable[..., None]:
-    from fmha_sm100.icp.local_indexer import bind_cute_launch
-
-    return bind_cute_launch(
-        scorer,
-        block_table,
-        query_start_loc,
-        seq_lens,
-        positions,
-        active_rows,
-        scores,
-        valid,
-    )
-
-
-def _bind_fmha_launch(
-    fmha: Callable[..., None],
-    plan: dict,
-    row_begin: int,
-    rows: int,
-    **kwargs,
-) -> Callable[..., None]:
-    from fmha_sm100.icp.local_indexer import bind_fmha_launch
-
-    return bind_fmha_launch(fmha, plan, row_begin, rows, **kwargs)
-
-
-# Per-layer host validators -- the CuTe launch check, the chunk contract
-# assertions and the invocation shape checks -- run on the first sparse layer
-# of each step only. `1` runs them on every layer and chunk. Startup checks and
-# the per-step builder checks always run.
-_DEBUG_CHECKS_ENV = "VLLM_MINIMAX_ICP_DEBUG_CHECKS"
-
-
-def _debug_checks_enabled() -> bool:
-    import os  # noqa: PLC0415
-
-    raw = os.environ.get(_DEBUG_CHECKS_ENV, "0").strip().lower()
-    if raw in ("", "0", "false", "off", "no"):
-        return False
-    if raw in ("1", "true", "on", "yes"):
-        return True
-    raise ValueError(f"{_DEBUG_CHECKS_ENV}={raw!r} must be 0 or 1")
 
 
 # Startup marker of the r13 prefill/mix path.
 _ICP_PREFILL_PATH_MARKER = "ICP_PREFILL_PATH"
 # One line with the effective decode profile, for the end-to-end qualification.
 _ICP_DECODE_PROFILE_MARKER = "ICP_DECODE_PROFILE"
-# `fail` (default): a prewarmed MSA ICP cache that does not cover the
-# installed sources stops startup; `warn` logs and continues.
-_PREWARM_CHECK_ENV = "VLLM_MINIMAX_ICP_PREWARM_CHECK"
 _prewarm_checked = False
 _decode_profile_logged = False
-# Knobs of features v13 deleted, with the value that IS v13's behaviour (None:
-# no value is v13's). Any other setting is refused, never silently ignored.
-_REMOVED_ICP_ENV = {
-    "VLLM_MINIMAX_ICP_MAX_KV_SPLITS": "1",
-    "VLLM_MINIMAX_ICP_MIN_SPLIT_TILES": None,
-    "VLLM_MINIMAX_ICP_MIXED_CUTE": "off",
-    "VLLM_MINIMAX_ICP_DECODE_CHUNK": "fixed",
-    "VLLM_MINIMAX_ICP_CUTE_SPLIT_K": "128",
-    "VLLM_MINIMAX_ICP_FUSED_END_WAIT": "1",
-}
 
 
-def _refuse_removed_icp_env() -> None:
-    import os  # noqa: PLC0415
-
-    bad = {
-        name: os.environ[name]
-        for name, keep in _REMOVED_ICP_ENV.items()
-        if name in os.environ and os.environ[name].strip().lower() != keep
-    }
-    if bad:
-        raise RuntimeError(
-            f"ICP: {sorted(bad)} select features removed in v13 ({bad}); unset "
-            "them (v13 behaviour: "
-            + ", ".join(f"{k}={v}" for k, v in _REMOVED_ICP_ENV.items() if v)
-            + ")."
-        )
-
-
-def _log_decode_profile(rank: int, exchange: object, chunk: int, d3: bool) -> None:
+def _log_decode_profile(rank: int, exchange: object, chunk: int) -> None:
     """Once per process: the decode profile of the BOUND exchange."""
     global _decode_profile_logged
     if _decode_profile_logged:
@@ -538,12 +217,6 @@ def _log_decode_profile(rank: int, exchange: object, chunk: int, d3: bool) -> No
     profile = getattr(exchange, "decode_profile", None)
     if profile is None:
         raise RuntimeError("ICP: the bound candidate exchange has no decode_profile")
-    if profile["d3"] != int(d3):
-        raise RuntimeError(
-            f"ICP: the bound exchange has d3={profile['d3']} but the indexer "
-            f"metadata was built with d3={int(d3)}; set {FUSED_DECODE_ENV} "
-            "identically for every process."
-        )
     logger.info(
         "%s rank=%d split_k=%d chunk=%d exchange=%s merge=%s d3=%d pdl=%d",
         _ICP_DECODE_PROFILE_MARKER,
@@ -566,56 +239,24 @@ def _assert_icp_prewarm(rank: int) -> None:
     # The producer is an AOT vLLM op; MSA's manifest covers the JIT kernels.
     # A warning-only cache policy must not admit a stale compound-page writer.
     require_icp_writer()
-    import os  # noqa: PLC0415
-
-    mode = os.environ.get(_PREWARM_CHECK_ENV, "fail").strip().lower() or "fail"
-    if mode not in ("fail", "warn"):
-        raise ValueError(f"{_PREWARM_CHECK_ENV}={mode!r} must be fail or warn")
     try:
         from fmha_sm100.icp import prewarm  # noqa: PLC0415
     except ImportError as exc:
-        message = f"ICP prewarm verification is unavailable: {exc}"
-        if mode == "fail":
-            raise RuntimeError(message) from exc
-        logger.warning("ICP_PREWARM_PROBLEM rank=%d %s", rank, message)
-        _prewarm_checked = True
-        return
+        raise RuntimeError(f"ICP prewarm verification is unavailable: {exc}") from exc
     problems = prewarm.check()
-    if problems and mode == "fail":
+    if problems:
         raise RuntimeError(
             "ICP kernels are not fully prewarmed for this image; serving would "
-            f"JIT-compile ({_PREWARM_CHECK_ENV}=warn to continue): {problems}"
+            f"JIT-compile: {problems}"
         )
-    for problem in problems:
-        logger.warning("ICP_PREWARM_PROBLEM rank=%d %s", rank, problem)
-    if not problems:
-        logger.info("ICP_PREWARM_VERIFIED rank=%d", rank)
+    logger.info("ICP_PREWARM_VERIFIED rank=%d", rank)
     _prewarm_checked = True
 
 
-# `0` launches the decode scorer, selector and K5T without PDL.
-_DECODE_PDL_ENV = "VLLM_MINIMAX_ICP_DECODE_PDL"
 # The fused ICP producer (sparse_attention_icp.py) must stay a non-PDL launch:
 # it is the full barrier that makes the CuTe scorer's pre-wait reads of
 # GPU-produced step metadata (Model Runner V2) safe.
 ICP_PRODUCER_ENABLE_PDL = False
-
-
-def _env_flag(name: str, default: bool) -> bool:
-    import os  # noqa: PLC0415
-
-    raw = os.environ.get(name, "").strip().lower()
-    if raw == "":
-        return default
-    if raw in ("0", "false", "off", "no"):
-        return False
-    if raw in ("1", "true", "on", "yes"):
-        return True
-    raise ValueError(f"{name}={raw!r} must be 0 or 1")
-
-
-def _decode_pdl_enabled() -> bool:
-    return _env_flag(_DECODE_PDL_ENV, True)
 
 
 def _icp_fused_publish(scores, geometry, token_offset, exchange, layer_idx):
@@ -683,26 +324,9 @@ def _msa_cute_decode_module() -> Any:
 _ICP_CUTE_STATUS_MARKER = "ICP_CUTE_DECODE_STATUS"
 _ICP_CUTE_ENGAGED_MARKER = "ICP_CUTE_DECODE_ENGAGED"
 
-_CUTE_DECODE_MODE_ENV = "VLLM_MINIMAX_ICP_CUTE_DECODE"
-# `strict` (default): at ICP2 an unusable CuTe route is a startup failure.
-# `auto`: warn and fall back to the FMHA scorer. `off`: do not probe at all.
-_CUTE_DECODE_MODES = ("strict", "auto", "off")
-
 # r13's fixed CuTe decode split; MSA's per-request-count `auto_split_k` (0) is
 # never selected.
 ICP_CUTE_SPLIT_K = 128
-
-
-def _cute_decode_mode() -> str:
-    """`strict` (hard-fail, default), `auto` (fall back to FMHA), or `off`."""
-    import os  # noqa: PLC0415
-
-    mode = os.environ.get(_CUTE_DECODE_MODE_ENV, "strict").strip().lower()
-    if mode not in _CUTE_DECODE_MODES:
-        raise ValueError(
-            f"{_CUTE_DECODE_MODE_ENV}={mode!r} is not one of {_CUTE_DECODE_MODES}"
-        )
-    return mode
 
 
 # Which selector arm the decode band runs. Greppable, because the arm is a
@@ -710,49 +334,11 @@ def _cute_decode_mode() -> str:
 # an A/B cannot tell which one produced its numbers.
 _ICP_DECODE_SELECTOR_MARKER = "ICP_DECODE_SELECTOR"
 
-_DECODE_SELECTOR_ENV = "VLLM_MINIMAX_ICP_DECODE_SELECTOR"
-# `full_row` (default): the exact full-row decode Top-16 arm. `bounded`: the arm
-# this integration shipped before, kept reachable as the rollback path.
-# These are not a fallback pair. An unusable `full_row` is a STARTUP failure,
-# because the bounded arm serves normally and a silent demotion would quietly
-# measure the kernel the mode exists to replace.
-_DECODE_SELECTOR_MODES = ("bounded", "full_row")
-
-# The full-row arm covers capacities up to this column count; above it the
-# package's own dispatch hands the work to the bounded partitioned selector.
-# That fallback is correct but silent, so admission is refused here instead.
-# Now that `full_row` is the default, that refusal is the DEFAULT behaviour above
-# the ceiling: P128 at max_model_len 1048576 is exactly 8192 columns, so any
-# larger context refuses at startup until the arm covers it. `bounded` serves it.
+# Above this the package silently dispatches to the bounded selector; refuse.
 _ICP_FULL_ROW_MAX_COLUMNS = 8192
 
 
-def _decode_selector_mode() -> str:
-    """`full_row` (default) or `bounded`."""
-    import os  # noqa: PLC0415
-
-    mode = os.environ.get(_DECODE_SELECTOR_ENV, "full_row").strip().lower()
-    if mode not in _DECODE_SELECTOR_MODES:
-        raise ValueError(
-            f"{_DECODE_SELECTOR_ENV}={mode!r} is not one of {_DECODE_SELECTOR_MODES}"
-        )
-    return mode
-
-
-# Which selector arm the PREFILL band runs, and under which tuning controls.
-# Greppable for the same reason the decode marker is: both arms serve
-# identically, so without a log line an A/B cannot tell which one produced its
-# numbers -- and here the controls matter as much as the arm, because
-# `RADIX_FULL_ROW` at the package's default `(512, 3)` is a different kernel
-# configuration from the one that was measured.
 _ICP_PREFILL_SELECTOR_MARKER = "ICP_PREFILL_SELECTOR"
-
-_PREFILL_SELECTOR_ENV = "VLLM_MINIMAX_ICP_PREFILL_SELECTOR"
-# `full_row` (default): the tuned full-row prefill arm, as r13. `bounded`: the
-# arm this integration shipped before, kept reachable as the rollback path. An
-# unusable `full_row` is a STARTUP failure, as on the decode band.
-_PREFILL_SELECTOR_MODES = ("bounded", "full_row")
-
 # Above this column count the package's own dispatch hands full-row work to the
 # bounded partitioned selector (PREFILL_SELECTION.md, "Controls and dispatch":
 # `Full-row, N > 8192: bounded fallback`). That fallback is correct but silent,
@@ -769,40 +355,6 @@ _ICP_PREFILL_FULL_ROW_CACHED_ITEMS = 0
 # finishTrue won only for the paired history-zero capacities; at 150K and 500K
 # (N=1180..1300 and N=3916..4036) finishFalse won at both L2 controls.
 _ICP_PREFILL_FOUR_WARP_FINISH_MAX_COLUMNS = 128
-
-# What the package itself defaults to, used verbatim on the `bounded` rollback:
-# `_prefill_full_row_config` rejects non-default controls unless the arm is
-# `RADIX_FULL_ROW`, so the rollback path must hand back the defaults exactly.
-_ICP_PREFILL_BOUNDED_CONTROLS = (512, 3, False)
-
-
-def _prefill_selector_mode() -> str:
-    """`full_row` (default) or `bounded`."""
-    import os  # noqa: PLC0415
-
-    mode = os.environ.get(_PREFILL_SELECTOR_ENV, "full_row").strip().lower()
-    if mode not in _PREFILL_SELECTOR_MODES:
-        raise ValueError(
-            f"{_PREFILL_SELECTOR_ENV}={mode!r} is not one of {_PREFILL_SELECTOR_MODES}"
-        )
-    return mode
-
-
-def _prefill_full_row_controls(columns: int) -> tuple[int, int, bool]:
-    from fmha_sm100.icp.local_indexer import prefill_full_row_controls
-
-    return prefill_full_row_controls(
-        columns,
-        threads=_ICP_PREFILL_FULL_ROW_THREADS,
-        cached_items=_ICP_PREFILL_FULL_ROW_CACHED_ITEMS,
-        four_warp_finish_max_columns=_ICP_PREFILL_FOUR_WARP_FINISH_MAX_COLUMNS,
-    )
-
-
-def _prefill_selector_kwargs(controls: tuple[int, int, bool]) -> dict:
-    from fmha_sm100.icp.local_indexer import prefill_selector_kwargs
-
-    return prefill_selector_kwargs(controls)
 
 
 def _select_arm_enum():
@@ -1193,6 +745,7 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
         allocation plus a JIT build.
         """
         msa_icp = require_msa_icp()
+        from fmha_sm100.icp import exchange_plan, local_indexer  # noqa: PLC0415
         from fmha_sm100.icp.abi import QCAPACITY_ALIGNMENT  # noqa: PLC0415
         from fmha_sm100.icp.candidates import (  # noqa: PLC0415
             CANDIDATE_MAPPING_ABI_VERSION,
@@ -1279,14 +832,11 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
         self.icp_cute_factory_has_page_size = False
         self.icp_cute_factory_has_pdl = False
         self._icp_cute_dtypes_checked = False
-        self.icp_cute_mode = _cute_decode_mode()
         # Why the route is or is not available, in one greppable string: the
         # startup half of the engagement evidence, the forward half being the
         # `_ICP_CUTE_ENGAGED_MARKER` line emitted at first invocation.
         self.icp_cute_status = "disabled: icp_c != 2"
-        if self.icp_c == 2 and self.icp_cute_mode == "off":
-            self.icp_cute_status = f"disabled: {_CUTE_DECODE_MODE_ENV}=off"
-        elif self.icp_c == 2 and self.icp_cute_module is None:
+        if self.icp_c == 2 and self.icp_cute_module is None:
             self.icp_cute_status = (
                 "unavailable: fmha_sm100.icp_decode_score is not installed "
                 "(this image predates the MSA CuTe decode scorer)"
@@ -1345,23 +895,11 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
             self.icp_rank,
             self.icp_cute_status,
         )
-        # Default `strict`: at ICP2 an unusable CuTe route is a startup failure,
-        # because the demoted run still serves and every number it produces
-        # belongs to the FMHA `OnlyScoreIcp` scorer instead. `auto` accepts the
-        # fallback deliberately, `off` disables the route.
-        if (
-            self.icp_c == 2
-            and self.icp_cute_mode == "strict"
-            and not self.icp_cute_query_lens
-        ):
+        # A silent FMHA fallback would serve while measuring the wrong kernel.
+        if self.icp_c == 2 and not self.icp_cute_query_lens:
             raise RuntimeError(
                 "MiniMax ICP CuTe decode scorer is required at ICP2 but is "
-                f"not usable: {self.icp_cute_status}. Continuing would fall "
-                "back to the FMHA OnlyScoreIcp scorer and serve normally "
-                "while measuring the kernel this route exists to replace. "
-                f"Set {_CUTE_DECODE_MODE_ENV}=auto to accept that fallback "
-                f"deliberately, or {_CUTE_DECODE_MODE_ENV}=off to disable the "
-                "route."
+                f"not usable: {self.icp_cute_status}."
             )
         # P128 only, so the score/table column count and the global B128 id
         # space are the same quantity and share one name.
@@ -1372,108 +910,59 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
         # fixes the arm's dispatch before graph capture, so this cannot be a
         # per-invocation choice; it is carried on the metadata state and read at
         # the call site.
-        self.icp_decode_selector_mode = _decode_selector_mode()
-        self.icp_decode_arm = _select_arm_enum().RADIX_BOUNDED
-        if self.icp_decode_selector_mode == "full_row":
-            arm = getattr(_select_arm_enum(), "RADIX_FULL_ROW", None)
-            if arm is None:
-                raise RuntimeError(
-                    "full_row (the default decode selector mode) requires an "
-                    "fmha_sm100.icp package that defines "
-                    "SelectArm.RADIX_FULL_ROW; the installed one does not. "
-                    "Bump the package, or set "
-                    f"{_DECODE_SELECTOR_ENV}=bounded to roll back."
-                )
-            if self.icp_max_blocks > _ICP_FULL_ROW_MAX_COLUMNS:
-                raise RuntimeError(
-                    "full_row (the default decode selector mode) admits up to "
-                    f"{_ICP_FULL_ROW_MAX_COLUMNS} B128 columns, but this "
-                    f"deployment's capacity is {self.icp_max_blocks} "
-                    f"(max_model_len={vllm_config.model_config.max_model_len}, "
-                    f"page={physical_page_tokens}). The package would dispatch "
-                    "to the bounded partitioned selector with no log line, so "
-                    "the run would report an arm it did not use. Set "
-                    f"{_DECODE_SELECTOR_ENV}=bounded to serve this capacity."
-                )
-            self.icp_decode_arm = arm
+        arm = getattr(_select_arm_enum(), "RADIX_FULL_ROW", None)
+        if arm is None:
+            raise RuntimeError(
+                "ICP requires an fmha_sm100.icp package that defines "
+                "SelectArm.RADIX_FULL_ROW."
+            )
+        if self.icp_max_blocks > _ICP_FULL_ROW_MAX_COLUMNS:
+            raise RuntimeError(
+                f"The ICP full-row selector admits up to {_ICP_FULL_ROW_MAX_COLUMNS} "
+                f"B128 columns; this deployment needs {self.icp_max_blocks} "
+                f"(max_model_len={vllm_config.model_config.max_model_len})."
+            )
+        self.icp_decode_arm = arm
         logger.info(
-            "%s rank=%d arm=%s mode=%s capacity=%d columns",
+            "%s rank=%d arm=%s mode=full_row capacity=%d columns",
             _ICP_DECODE_SELECTOR_MARKER,
             self.icp_rank,
             self.icp_decode_arm.name,
-            self.icp_decode_selector_mode,
             self.icp_max_blocks,
         )
-        # D3 publishes from the full-row selector's epilogue; no other arm has
-        # one. The exchange reads the same env, so a mismatch cannot start.
-        _refuse_removed_icp_env()
-        self.icp_fused_decode = fused_decode_requested()
-        if self.icp_fused_decode and self.icp_decode_selector_mode != "full_row":
-            raise RuntimeError(
-                f"D3 ({FUSED_DECODE_ENV}, default 1) needs the full_row decode "
-                f"selector; got {self.icp_decode_selector_mode!r}. Set "
-                f"{FUSED_DECODE_ENV}=0 to serve this selector over K5T."
-            )
+        # D3 publishes from the full-row selector's epilogue.
+        self.icp_fused_decode = True
         # The PREFILL selector arm, resolved ONCE at startup for the same reason
         # the decode arm is -- except that prefill is eager, so what is fixed
         # here is the recipe, not a capture. The CONTROLS still vary per rung
         # (the four-warp finish is a small-capacity choice), so only the arm and
         # the mode are startup constants; `_build_icp` derives the controls from
         # the rung it selects.
-        self.icp_prefill_selector_mode = _prefill_selector_mode()
-        self.icp_prefill_arm = _select_arm_enum().RADIX_BOUNDED
-        if self.icp_prefill_selector_mode == "full_row":
-            arm = getattr(_select_arm_enum(), "RADIX_FULL_ROW", None)
-            if arm is None:
-                raise RuntimeError(
-                    "full_row (the default prefill selector mode) requires an "
-                    "fmha_sm100.icp package that defines "
-                    "SelectArm.RADIX_FULL_ROW; the installed one does not. "
-                    "Bump the package, or set "
-                    f"{_PREFILL_SELECTOR_ENV}=bounded to roll back."
-                )
-            if self.icp_max_blocks > _ICP_PREFILL_FULL_ROW_MAX_COLUMNS:
-                raise RuntimeError(
-                    "full_row (the default prefill selector mode) admits up to "
-                    f"{_ICP_PREFILL_FULL_ROW_MAX_COLUMNS} B128 columns, but "
-                    f"this deployment's capacity is {self.icp_max_blocks} "
-                    f"(max_model_len={vllm_config.model_config.max_model_len}, "
-                    f"page={physical_page_tokens}). The package would dispatch "
-                    "to the bounded partitioned selector with no log line, so "
-                    "the run would report an arm it did not use. Set "
-                    f"{_PREFILL_SELECTOR_ENV}=bounded to serve this capacity."
-                )
-            self.icp_prefill_arm = arm
-        if self.icp_prefill_selector_mode == "full_row":
-            controls = (
-                f"threads={_ICP_PREFILL_FULL_ROW_THREADS} "
-                f"cached_items={_ICP_PREFILL_FULL_ROW_CACHED_ITEMS} "
-                "four_warp_finish=columns<="
-                f"{_ICP_PREFILL_FOUR_WARP_FINISH_MAX_COLUMNS}"
+        if self.icp_max_blocks > _ICP_PREFILL_FULL_ROW_MAX_COLUMNS:
+            raise RuntimeError(
+                "The ICP prefill full-row selector admits up to "
+                f"{_ICP_PREFILL_FULL_ROW_MAX_COLUMNS} B128 columns; this "
+                f"deployment needs {self.icp_max_blocks}."
             )
-        else:
-            controls = "package defaults"
+        self.icp_prefill_arm = arm
         logger.info(
-            "%s rank=%d arm=%s mode=%s capacity=%d columns %s",
+            "%s rank=%d arm=%s mode=full_row capacity=%d columns "
+            "threads=%d cached_items=%d four_warp_finish=columns<=%d",
             _ICP_PREFILL_SELECTOR_MARKER,
             self.icp_rank,
             self.icp_prefill_arm.name,
-            self.icp_prefill_selector_mode,
             self.icp_max_blocks,
-            controls,
+            _ICP_PREFILL_FULL_ROW_THREADS,
+            _ICP_PREFILL_FULL_ROW_CACHED_ITEMS,
+            _ICP_PREFILL_FOUR_WARP_FINISH_MAX_COLUMNS,
         )
         # The exchange's admitted extents, from the config alone -- the same
         # call `nvidia/model.py:_bind_candidate_exchange` makes, so the ladder
         # the builder selects from IS the ladder the windows were built for.
         # The mirror of the ABI's row alignment is cross-checked against the
         # real constant here, where both are in scope.
-        assert _DISPATCH_QCAPACITY_ALIGNMENT == QCAPACITY_ALIGNMENT, (
-            "icp_dispatch.QCAPACITY_ALIGNMENT "
-            f"({_DISPATCH_QCAPACITY_ALIGNMENT}) has drifted from "
-            f"fmha_sm100.icp.abi.QCAPACITY_ALIGNMENT ({QCAPACITY_ALIGNMENT})."
-        )
         max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        self.icp_exchange_capacities = exchange_token_capacities(
+        self.icp_exchange_capacities = exchange_plan.exchange_token_capacities(
             max_token_capacity=max_num_batched_tokens,
             cudagraph_capture_sizes=(
                 vllm_config.compilation_config.cudagraph_capture_sizes or ()
@@ -1508,11 +997,13 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
         # `icp_decode_plans`, `icp_decode_workspaces`). The two bands select out
         # of their own lists; only the shared exchange instance sees the union,
         # which is what `nvidia/model.py` builds it from.
-        self.icp_prefill_exchange_capacities = prefill_exchange_token_capacities(
-            max_token_capacity=max_num_batched_tokens,
+        self.icp_prefill_exchange_capacities = (
+            exchange_plan.prefill_exchange_token_capacities(
+                max_token_capacity=max_num_batched_tokens,
+            )
         )
         assert self.icp_prefill_exchange_capacities[-1] == self.icp_token_capacity
-        self.icp_admitted_exchange_extents = admitted_exchange_extents(
+        self.icp_admitted_exchange_extents = exchange_plan.admitted_exchange_extents(
             max_token_capacity=max_num_batched_tokens,
             cudagraph_capture_sizes=(
                 vllm_config.compilation_config.cudagraph_capture_sizes or ()
@@ -1532,38 +1023,21 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
         # ---- the prefill wave ladder ----------------------------------------
         # One rung per admitted score-column extent; the build picks the
         # smallest rung that covers the invocation's host-bounded live extent.
-        # `_prefill_wave_override` collapses the ladder to a single pinned width
-        # at FULL capacity columns, which is the profiling lane's control arm
-        # (128 reproduces the shipped schedule exactly).
-        self.icp_prefill_budget_bytes = _prefill_score_budget_bytes()
-        self.icp_prefill_pinned_wave = _prefill_wave_override()
-        self.icp_decode_pdl = _decode_pdl_enabled()
-        if self.icp_prefill_pinned_wave is None:
-            self.icp_prefill_columns = icp_prefill_column_rungs(self.icp_max_blocks)
-            self.icp_prefill_waves = icp_prefill_wave_ladder(
-                self.icp_prefill_columns,
-                heads_group=self.icp_heads_group,
-                token_capacity=self.icp_token_capacity,
-                budget_bytes=self.icp_prefill_budget_bytes,
-            )
-        else:
-            # A pin collapses the ladder to ONE width at FULL capacity columns.
-            # A pin wider than the invocation is REFUSED, not clamped, so a
-            # sweep arm cannot be mislabelled with a width it never ran.
-            budget_rows = (
-                _cdiv(self.icp_token_capacity, ICP_MSA_QUERY_TILE_TOKENS)
-                * ICP_MSA_QUERY_TILE_TOKENS
-            )
-            if self.icp_prefill_pinned_wave > budget_rows:
-                raise ValueError(
-                    f"{_PREFILL_WAVE_ENV}={self.icp_prefill_pinned_wave} is "
-                    f"wider than this deployment's {budget_rows}-row token "
-                    f"budget (padded capacity {self.icp_token_capacity}). The "
-                    "override exists to PIN A NARROWER wave for the profiling "
-                    "lane; a wider one cannot be scheduled."
-                )
-            self.icp_prefill_columns = (self.icp_max_blocks,)
-            self.icp_prefill_waves = {self.icp_max_blocks: self.icp_prefill_pinned_wave}
+        self.icp_prefill_budget_bytes = ICP_PREFILL_SCORE_SCRATCH_BUDGET_BYTES
+        self.icp_decode_pdl = True
+        self.icp_prefill_columns = local_indexer.icp_prefill_column_rungs(
+            self.icp_max_blocks,
+            floor=ICP_PREFILL_COLUMN_FLOOR,
+            steps_per_octave=ICP_PREFILL_COLUMN_STEPS_PER_OCTAVE,
+        )
+        self.icp_prefill_waves = local_indexer.icp_prefill_wave_ladder(
+            self.icp_prefill_columns,
+            heads_group=self.icp_heads_group,
+            token_capacity=self.icp_token_capacity,
+            budget_bytes=self.icp_prefill_budget_bytes,
+            max_wave=ICP_MAX_PREFILL_WAVE_TOKENS,
+            query_tile_tokens=ICP_MSA_QUERY_TILE_TOKENS,
+        )
         self.icp_prefill_max_wave = max(self.icp_prefill_waves.values())
         self.icp_prefill_min_wave = min(self.icp_prefill_waves.values())
 
@@ -1571,14 +1045,17 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
         # startup constant: `icp_select_extents`, `icp_decode_plans` and
         # `icp_decode_workspaces` are derived from it and ARE the captured
         # decode profiles.
-        prefill_elems = icp_prefill_arena_elems(
+        prefill_elems = local_indexer.icp_prefill_arena_elems(
             self.icp_prefill_waves, self.icp_heads_group
         )
-        self.icp_chunk = icp_decode_chunk_tokens(
+        self.icp_chunk = local_indexer.icp_decode_chunk_tokens(
             max_model_len=vllm_config.model_config.max_model_len,
             heads_group=self.icp_heads_group,
             token_capacity=self.icp_token_capacity,
             physical_page_tokens=physical_page_tokens,
+            budget_bytes=ICP_SCORE_SCRATCH_BUDGET_BYTES,
+            max_chunk=ICP_MAX_OUTER_CHUNK_TOKENS,
+            query_tile_tokens=ICP_MSA_QUERY_TILE_TOKENS,
         )
         split_sizes = sorted(
             size
@@ -1632,24 +1109,15 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
         )
         logger.info(
             "%s rank=%d r13 prefill/mix: device_plan num_kv_splits=%d plan_slots=%d "
-            "prefill_selector=%s mixed_steps=fmha_only rungs=geometric "
+            "prefill_selector=full_row mixed_steps=fmha_only rungs=geometric "
             "max_wave=%d exchange=native_pack+all_to_all+k2 | decode: "
-            "decode chunk %d rows (fixed) %s=%s %s=%d %s=%d %s=%d",
+            "decode chunk %d rows (fixed) cute=strict pdl=1 d3=1",
             _ICP_PREFILL_PATH_MARKER,
             self.icp_rank,
             self.icp_plan_store.max_kv_splits,
             self.icp_plan_store.num_slots,
-            self.icp_prefill_selector_mode,
             self.icp_prefill_max_wave,
             self.icp_chunk,
-            _CUTE_DECODE_MODE_ENV,
-            self.icp_cute_mode,
-            _DEBUG_CHECKS_ENV,
-            int(_debug_checks_enabled()),
-            _DECODE_PDL_ENV,
-            int(self.icp_decode_pdl),
-            FUSED_DECODE_ENV,
-            int(self.icp_fused_decode),
         )
         _assert_icp_prewarm(self.icp_rank)
         if self.icp_decode_pdl and ICP_PRODUCER_ENABLE_PDL:
@@ -1671,7 +1139,7 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
         # wrote: each selector reads only rows its own scorer just wrote, and
         # only the exact live prefix of each (ABI2; the FMHA producer
         # completes its advertised rectangle). Decode's CuTe scorer, decode
-        # selector and K5T are PDL launches (`VLLM_MINIMAX_ICP_DECODE_PDL`),
+        # selector and K5T are PDL launches,
         # but each executes griddepcontrol.wait before its first store and
         # before reading anything its predecessor wrote; the scorer's only
         # pre-wait reads are step inputs written before the forward (by GPU
@@ -1950,12 +1418,7 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
             _ICP_PREFILL_WAVE_MARKER,
             self.icp_c,
             self.icp_rank,
-            (
-                f"pinned wave {self.icp_prefill_pinned_wave} at full capacity "
-                "columns (MEASUREMENT CONTROL, not a serving mode)"
-                if self.icp_prefill_pinned_wave is not None
-                else "wave derived per invocation from the admitted live column extent"
-            ),
+            "wave derived per invocation from the admitted live column extent",
             self.icp_prefill_budget_bytes // 2**20,
             len(self.icp_prefill_columns),
             arena_bytes,
@@ -1970,21 +1433,6 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
             self.icp_prefill_one_launch_columns,
             self.icp_prefill_one_launch_columns * physical_page_tokens,
         )
-        if self.icp_prefill_pinned_wave is not None:
-            logger.warning(
-                "%s (W=%d rank=%d): the prefill wave is PINNED at %d rows, so a "
-                "%d-row prefill runs %d serial scorer+selector waves per sparse "
-                "layer whatever its history is. %s is a measurement control for "
-                "the profiling lane and must not be set on a serving "
-                "deployment.",
-                _ICP_PREFILL_WAVE_MARKER,
-                self.icp_c,
-                self.icp_rank,
-                self.icp_prefill_pinned_wave,
-                self.icp_token_capacity,
-                _cdiv(self.icp_token_capacity, self.icp_prefill_pinned_wave),
-                _PREFILL_WAVE_ENV,
-            )
         if self.icp_prefill_one_launch_columns < self.icp_max_blocks:
             logger.warning(
                 "%s (W=%d rank=%d): a %d-row invocation whose live history "
@@ -1993,7 +1441,7 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
                 "per sparse layer. This is bounded and LOGGED, not silent -- a "
                 "wave that quietly falls back to one %d-row inner tile is the "
                 "defect this ladder replaces. One launch at capacity would "
-                "need %d MiB; raise it with %s.",
+                "need %d MiB.",
                 _ICP_PREFILL_WAVE_MARKER,
                 self.icp_c,
                 self.icp_rank,
@@ -2007,7 +1455,6 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
                     one_launch * self.icp_heads_group * self.icp_max_blocks * 5,
                     2**20,
                 ),
-                _PREFILL_SCORE_MIB_ENV,
             )
         # The eager prefill EXCHANGE EXTENT ladder, a separate record from the
         # wave schema above because it is a separate quantity: candidate rows
@@ -2017,7 +1464,7 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
         # H_group index heads x 16 candidate records x (fp32 score bits, int32
         # id). The over-run figure is the largest ratio between neighbouring
         # rungs, which is what a row count landing just above a rung pays.
-        bytes_per_row = self.icp_heads_group * _DISPATCH_CAND_K * 2 * 4
+        bytes_per_row = self.icp_heads_group * 16 * 2 * 4
         prefill_extents = self.icp_prefill_exchange_capacities
         worst_ratio = max(
             (hi / (lo + 1) for lo, hi in zip(prefill_extents, prefill_extents[1:])),
@@ -2038,7 +1485,7 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
             self.icp_c,
             self.icp_rank,
             len(prefill_extents),
-            ICP_PREFILL_EXTENT_STEPS_PER_OCTAVE,
+            exchange_plan.ICP_PREFILL_EXTENT_STEPS_PER_OCTAVE,
             QCAPACITY_ALIGNMENT,
             prefill_extents,
             bytes_per_row,
@@ -2159,7 +1606,11 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
         ``kv_segment_lens``. The plan is sized by a bound, then masked and
         bounded by the exact value.
         """
+        from fmha_sm100.icp import local_indexer  # noqa: PLC0415
         from fmha_sm100.icp.candidates import live_blocks  # noqa: PLC0415
+        from fmha_sm100.icp.exchange_plan import (  # noqa: PLC0415
+            select_token_capacity,
+        )
 
         _fmha_sm100_plan = _msa_api()._fmha_sm100_plan
 
@@ -2344,7 +1795,7 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
                 ),
                 self.icp_max_blocks,
             )
-            score_columns = icp_prefill_rung(
+            score_columns = local_indexer.icp_prefill_rung(
                 self.icp_prefill_columns, invocation_live_blocks
             )
             width = self.icp_prefill_waves[score_columns]
@@ -2363,10 +1814,11 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
         # chunk's live extent, which is a device-bounded quantity. On the
         # decode band this is unused (`select_decode_candidates` takes none of
         # it) but still consistent, so the state never carries a stale pairing.
-        prefill_controls = (
-            _prefill_full_row_controls(score_columns)
-            if self.icp_prefill_selector_mode == "full_row"
-            else _ICP_PREFILL_BOUNDED_CONTROLS
+        prefill_controls = local_indexer.prefill_full_row_controls(
+            score_columns,
+            threads=_ICP_PREFILL_FULL_ROW_THREADS,
+            cached_items=_ICP_PREFILL_FULL_ROW_CACHED_ITEMS,
+            four_warp_finish_max_columns=_ICP_PREFILL_FOUR_WARP_FINISH_MAX_COLUMNS,
         )
 
         # ---- one scorer + selector per window, bound once per step ---------
@@ -2384,7 +1836,7 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
 
         fmha = _msa_api()._fmha_sm100
         chunks: list[MiniMaxM3IndexerICPChunk] = []
-        for window in icp_row_windows(
+        for window in local_indexer.icp_row_windows(
             num_tokens=num_tokens,
             cap=cap,
             cute_rows=cute_rows,
@@ -2406,7 +1858,7 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
             )
             out = self.icp_candidates[begin : begin + extent]
             if window.cute:
-                launch_window = icp_cute_decode_window(
+                launch_window = local_indexer.icp_cute_decode_window(
                     query_len=decode_query_len,
                     token_begin=t0,
                     rows=cute_rows - t0,
@@ -2471,7 +1923,7 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
                         cute_scorer=scorer,
                         rank_aware_nvalid=True,
                         geometry=geometry,
-                        launch_score=_bind_cute_launch(
+                        launch_score=local_indexer.bind_cute_launch(
                             scorer,
                             table,
                             query_start_loc,
@@ -2575,7 +2027,7 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
                     out=out,
                     partials=prefill_partials[:extent],
                     arm=self.icp_prefill_arm,
-                    **_prefill_selector_kwargs(prefill_controls),
+                    **local_indexer.prefill_selector_kwargs(prefill_controls),
                 )
             chunks.append(
                 MiniMaxM3IndexerICPChunk(
@@ -2593,7 +2045,7 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
                     icp_forced_column_v1=geometry.forced_column,
                     icp_active_rows=geometry.active_rows,
                     geometry=geometry,
-                    launch_score=_bind_fmha_launch(
+                    launch_score=local_indexer.bind_fmha_launch(
                         fmha,
                         plan,
                         t0,
@@ -2732,7 +2184,6 @@ class MiniMaxM3IndexerMSAImpl(MiniMaxM3IndexerImpl):
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
-        self._icp_debug_checks = _debug_checks_enabled()
         from fmha_sm100.icp.scorer.prefill import api  # noqa: PLC0415
 
         # The ICP score wave's output ABI. Version 1 signalled emptiness in band
@@ -2843,7 +2294,7 @@ class MiniMaxM3IndexerMSAImpl(MiniMaxM3IndexerImpl):
 
         Every launch argument was bound by the builder once per step; a layer
         only launches. The per-layer validators run on the first sparse layer
-        of a step, or on every layer under ``VLLM_MINIMAX_ICP_DEBUG_CHECKS=1``.
+        of a step.
         """
         md = index_md
         assert isinstance(md, MiniMaxM3IndexerMSAMetadata)
@@ -2858,8 +2309,7 @@ class MiniMaxM3IndexerMSAImpl(MiniMaxM3IndexerImpl):
             )
         buf = self.topk_indices_buffer
         assert buf is not None
-        debug = self._icp_debug_checks
-        if debug or not st.checked:
+        if not st.checked:
             self._check_icp_invocation(index_query, md, buf)
             st.checked = True
 
@@ -2878,23 +2328,20 @@ class MiniMaxM3IndexerMSAImpl(MiniMaxM3IndexerImpl):
         # D3: pure decode publishes from the selectors and the exchange below
         # only merges. A D3 exchange with a step that cannot publish every
         # row would time out, so that is refused here instead.
-        _log_decode_profile(
-            self.icp_rank, candidate_exchange, st.decode_chunk, st.fused_decode
-        )
+        _log_decode_profile(self.icp_rank, candidate_exchange, st.decode_chunk)
         fused = not st.has_prefill and getattr(
             candidate_exchange, "fused_decode", False
         )
         if fused and not st.fused_ready:
             raise RuntimeError(
                 f"{self.prefix}: the D3 exchange is bound but this decode step "
-                "has a window without a fused selector binding; build the "
-                f"metadata with the same {FUSED_DECODE_ENV} on every rank."
+                "has a window without a fused selector binding."
             )
         for chunk in st.chunks:
             # The selectors' own shape validation rides the same gate: the
             # first layer of a step validates, later layers take the
             # pre-validated native launch.
-            validate = debug or not chunk.checked
+            validate = not chunk.checked
             if validate:
                 self._check_icp_chunk(chunk, index_q, index_kv)
                 chunk.checked = True

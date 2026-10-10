@@ -10,18 +10,9 @@ import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from vllm.models.minimax_m3.nvidia.ops.icp_dispatch import (
-    BACKEND_K5T,
-    BACKEND_NCCL,
-    CLASSIC_MERGE_ENV,
-    FUSED_DECODE_ENV,
-    admitted_exchange_extents,
-    check_slot_discipline,
-    create_candidate_exchange,
-    decode_merge_mode,
-    fused_decode_requested,
-    select_backend,
-)
+from vllm.models.minimax_m3.nvidia.ops.icp_dispatch import create_candidate_exchange
+
+BACKEND_K5T = "k5t"
 
 
 class _FakeTiledExchange:
@@ -97,10 +88,6 @@ class _ForbidAten(TorchDispatchMode):
 def stub_kernels(monkeypatch):
     pytest.importorskip("fmha_sm100.icp")
     # No `exchange` (K5) or `merge` attributes: binding either would raise.
-    # These tests exercise the K5T decode route, which D3 (the default) replaces.
-    monkeypatch.setenv(FUSED_DECODE_ENV, "0")
-    monkeypatch.delenv(CLASSIC_MERGE_ENV, raising=False)
-    monkeypatch.delenv("VLLM_MINIMAX_ICP_DECODE_PDL", raising=False)
     fake_carrier = _FakeCarrier()
     tiled: Any = types.ModuleType("fmha_sm100.icp.tiled_exchange")
     tiled.IcpTiledExchange = _FakeTiledExchange
@@ -114,37 +101,58 @@ def stub_kernels(monkeypatch):
     return _FakeTiledExchange, fake_carrier
 
 
-def _exchange(capacities):
-    return create_candidate_exchange(
-        group=None,
-        world_size=2,
-        rank=0,
-        num_heads_local=2,
-        num_index_heads=4,
-        num_sparse_layers=57,
+_SHAPE = dict(
+    group=None,
+    world_size=2,
+    rank=0,
+    num_heads_local=2,
+    num_index_heads=4,
+    num_sparse_layers=57,
+    device=torch.device("cpu"),
+)
+
+
+def _exchange(capacities, *, use_pdl=True, classic_merge=False):
+    """The K5T route, which D3 replaces in serving."""
+    from fmha_sm100.icp.candidate_exchange import CandidateExchange
+
+    return CandidateExchange(
         token_capacities=capacities,
-        device=torch.device("cpu"),
+        fused_decode=False,
+        use_pdl=use_pdl,
+        classic_merge=classic_merge,
+        **_SHAPE,
     )
 
 
-def test_d3_is_the_default_decode_route(monkeypatch):
-    monkeypatch.delenv(FUSED_DECODE_ENV, raising=False)
-    monkeypatch.delenv(CLASSIC_MERGE_ENV, raising=False)
-    assert fused_decode_requested()
-    assert decode_merge_mode() == "network"
-    monkeypatch.setenv(FUSED_DECODE_ENV, "0")
-    assert not fused_decode_requested()
-    monkeypatch.setenv(CLASSIC_MERGE_ENV, "1")
-    assert decode_merge_mode() == "classic"
+def test_serving_policy_is_d3_pdl_network_merge(monkeypatch):
+    pytest.importorskip("fmha_sm100.icp")
+    import fmha_sm100.icp.candidate_exchange as owner
 
+    seen = {}
 
-def test_phase_alone_selects_the_route():
-    assert select_backend(has_prefill=True) == BACKEND_NCCL
-    assert select_backend(has_prefill=False) == BACKEND_K5T
+    class Recorder:
+        fused_decode = True
+
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+            self.decode_provenance = dict(symm_mib="0", tile_tok=1, resident_cap=1)
+            self.slots, self.token_capacity = kwargs["slots"], 4
+
+    monkeypatch.setattr(owner, "CandidateExchange", Recorder)
+    create_candidate_exchange(token_capacities=[4], **_SHAPE)
+    assert (seen["fused_decode"], seen["use_pdl"], seen["classic_merge"]) == (
+        True,
+        True,
+        False,
+    )
+    assert seen["slots"] == 3
 
 
 def test_slot_discipline_for_the_model_sweep():
     pytest.importorskip("fmha_sm100.icp")
+    from fmha_sm100.icp.exchange_plan import check_slot_discipline
+
     check_slot_discipline(57, 3)
     with pytest.raises(ValueError, match="wrap"):
         check_slot_discipline(58, 3)
@@ -157,6 +165,8 @@ def test_slot_discipline_for_the_model_sweep():
 def test_each_phase_takes_exactly_its_route_with_no_aten(
     stub_kernels, has_prefill, extent
 ):
+    from fmha_sm100.icp.exchange_plan import admitted_exchange_extents
+
     fake_cls, fake_carrier = stub_kernels
     extents = admitted_exchange_extents(max_token_capacity=16_384)
     exchange = _exchange(extents)
@@ -215,11 +225,9 @@ def test_unadmitted_extent_is_refused(stub_kernels):
 @pytest.mark.parametrize("classic_merge", [False, True])
 @pytest.mark.parametrize("use_pdl", [False, True])
 def test_decode_profile_reads_the_constructed_route(
-    stub_kernels, monkeypatch, classic_merge, use_pdl
+    stub_kernels, classic_merge, use_pdl
 ):
-    monkeypatch.setenv(CLASSIC_MERGE_ENV, str(int(classic_merge)))
-    monkeypatch.setenv("VLLM_MINIMAX_ICP_DECODE_PDL", str(int(use_pdl)))
-    exchange = _exchange([16, 32])
+    exchange = _exchange([16, 32], use_pdl=use_pdl, classic_merge=classic_merge)
     (fake,) = stub_kernels[0].instances
     assert fake.kwargs["classic_merge"] is classic_merge
     assert fake.kwargs["use_pdl"] is use_pdl
@@ -263,8 +271,7 @@ def test_d3_publishes_windows_then_merges_and_prefill_uses_nccl(
     fused: Any = types.ModuleType("fmha_sm100.icp.fused_exchange")
     fused.IcpFusedExchange = Fused
     monkeypatch.setitem(sys.modules, "fmha_sm100.icp.fused_exchange", fused)
-    monkeypatch.setenv(FUSED_DECODE_ENV, "1")
-    exchange = _exchange([4, 8])
+    exchange = create_candidate_exchange(token_capacities=[4, 8], **_SHAPE)
     assert not stub_kernels[0].instances
     assert exchange.decode_profile["d3"] == 1
     cand = torch.empty((8, 4, 16, 2), dtype=torch.int32)

@@ -4,12 +4,12 @@
 
 Imports of the optional kernel package remain lazy. Extent planning, retained
 workspaces and D3/K5T/NCCL submission belong to ``fmha_sm100.icp``; this adapter
-resolves environment flags and logs the admitted model configuration.
+fixes the serving policy (D3, PDL, network merge) and logs the configuration.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
@@ -23,93 +23,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Mirrors checked against the package during opted-in indexer initialization.
 CAND_K = 16
-QCAPACITY_ALIGNMENT = 4
-ICP_PREFILL_EXTENT_STEPS_PER_OCTAVE = 2
 ICP_EXCHANGE_SLOTS = 3
-ACK_FREE_SLOTS = 3
-BACKEND_NCCL = "nccl"
-BACKEND_K5T = "k5t"
-
-FUSED_DECODE_ENV = "VLLM_MINIMAX_ICP_DECODE_FUSED_EXCHANGE"
-CLASSIC_MERGE_ENV = "VLLM_MINIMAX_ICP_CLASSIC_MERGE"
-
-
-def _flag(name: str, default: bool) -> bool:
-    import os  # noqa: PLC0415
-
-    raw = os.environ.get(name, "").strip().lower()
-    if raw == "":
-        return default
-    if raw in ("0", "false", "off", "no"):
-        return False
-    if raw in ("1", "true", "on", "yes"):
-        return True
-    raise ValueError(f"{name}={raw!r} must be 0 or 1")
-
-
-def fused_decode_requested() -> bool:
-    """Whether the decode route is D3 rather than K5T (startup constant)."""
-    return _flag(FUSED_DECODE_ENV, True)
-
-
-def decode_merge_mode() -> str:
-    """`network` (shuffle-network merge, default) or `classic` (32-round)."""
-    return "classic" if _flag(CLASSIC_MERGE_ENV, False) else "network"
-
-
-def select_backend(has_prefill: bool) -> str:
-    """NCCL (native pack + all_to_all + K2) for prefill/mixed, K5T for decode."""
-    return BACKEND_NCCL if has_prefill else BACKEND_K5T
-
-
-def exchange_token_capacities(
-    *, max_token_capacity: int, cudagraph_capture_sizes: Iterable[int] = ()
-) -> list[int]:
-    from fmha_sm100.icp.exchange_plan import exchange_token_capacities as plan
-
-    return plan(
-        max_token_capacity=max_token_capacity,
-        cudagraph_capture_sizes=cudagraph_capture_sizes,
-    )
-
-
-def prefill_exchange_token_capacities(
-    *, max_token_capacity: int, steps_per_octave: int | None = None
-) -> list[int]:
-    from fmha_sm100.icp.exchange_plan import prefill_exchange_token_capacities as plan
-
-    return plan(
-        max_token_capacity=max_token_capacity, steps_per_octave=steps_per_octave
-    )
-
-
-def admitted_exchange_extents(
-    *,
-    max_token_capacity: int,
-    cudagraph_capture_sizes: Iterable[int] = (),
-    steps_per_octave: int | None = None,
-) -> list[int]:
-    from fmha_sm100.icp.exchange_plan import admitted_exchange_extents as plan
-
-    return plan(
-        max_token_capacity=max_token_capacity,
-        cudagraph_capture_sizes=cudagraph_capture_sizes,
-        steps_per_octave=steps_per_octave,
-    )
-
-
-def select_token_capacity(capacities: Sequence[int], num_tokens: int) -> int:
-    from fmha_sm100.icp.exchange_plan import select_token_capacity as select
-
-    return select(capacities, num_tokens)
-
-
-def check_slot_discipline(num_sparse_layers: int, slots: int) -> None:
-    from fmha_sm100.icp.exchange_plan import check_slot_discipline as check
-
-    check(num_sparse_layers, slots)
 
 
 def create_candidate_exchange(
@@ -123,7 +38,7 @@ def create_candidate_exchange(
     token_capacities: Sequence[int],
     device: torch.device,
 ) -> CandidateExchange:
-    """Construct the package owner after resolving vLLM's decode policy."""
+    """Construct the package owner with the qualified decode policy."""
     require_msa_icp()
     from fmha_sm100.icp.candidate_exchange import CandidateExchange
 
@@ -136,9 +51,9 @@ def create_candidate_exchange(
         num_sparse_layers=num_sparse_layers,
         token_capacities=token_capacities,
         device=device,
-        fused_decode=fused_decode_requested(),
-        use_pdl=_flag("VLLM_MINIMAX_ICP_DECODE_PDL", True),
-        classic_merge=decode_merge_mode() == "classic",
+        fused_decode=True,
+        use_pdl=True,
+        classic_merge=False,
         slots=ICP_EXCHANGE_SLOTS,
     )
     provenance = exchange.decode_provenance

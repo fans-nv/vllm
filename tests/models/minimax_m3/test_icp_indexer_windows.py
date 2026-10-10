@@ -26,12 +26,13 @@ if importlib.util.find_spec("cutlass") is None:
     sys.modules.setdefault(_stub.__name__, _stub)
 
 from vllm.models.minimax_m3.nvidia import indexer_icp as icp  # noqa: E402
-from vllm.models.minimax_m3.nvidia.ops.icp_dispatch import (  # noqa: E402
+
+msa_icp = pytest.importorskip("fmha_sm100.icp")
+from fmha_sm100.icp import local_indexer  # noqa: E402
+from fmha_sm100.icp.exchange_plan import (  # noqa: E402
     exchange_token_capacities,
     select_token_capacity,
 )
-
-msa_icp = pytest.importorskip("fmha_sm100.icp")
 
 MAX_TOKENS = 16384
 CAPTURE_SIZES = [1, 2, 4, *range(8, 256, 8), *range(256, 513, 16)]
@@ -46,7 +47,7 @@ def test_pure_decode_windows_keep_the_captured_selector_extents():
     )
     for num_tokens in (1, 24, 512, 3000):
         cap = select_token_capacity(capacities, num_tokens)
-        windows = icp.icp_row_windows(
+        windows = local_indexer.icp_row_windows(
             num_tokens=num_tokens,
             cap=cap,
             cute_rows=num_tokens,
@@ -78,21 +79,23 @@ def test_live_metadata_hands_the_device_plan_to_the_writer():
 # ---- item 2: one decode chunk per captured size ------------------------------
 
 
+def _decode_chunk(max_model_len, heads_group, token_capacity):
+    return local_indexer.icp_decode_chunk_tokens(
+        max_model_len=max_model_len,
+        heads_group=heads_group,
+        token_capacity=token_capacity,
+        physical_page_tokens=icp.PAGE_SIZE,
+        budget_bytes=icp.ICP_SCORE_SCRATCH_BUDGET_BYTES,
+        max_chunk=icp.ICP_MAX_OUTER_CHUNK_TOKENS,
+        query_tile_tokens=icp.ICP_MSA_QUERY_TILE_TOKENS,
+    )
+
+
 @pytest.mark.parametrize("max_model_len", [131072, 262144, 524288, 1048576])
 @pytest.mark.parametrize("token_capacity", [2048, 8192, 16384])
 def test_decode_chunk_is_r13_fixed_budget(max_model_len, token_capacity):
     heads_group = 4
-    chunk = icp.icp_decode_chunk_tokens(
-        max_model_len=max_model_len,
-        heads_group=heads_group,
-        token_capacity=token_capacity,
-    )
-    assert chunk == icp.icp_outer_chunk_tokens(
-        max_model_len=max_model_len,
-        heads_group=heads_group,
-        token_capacity=token_capacity,
-        budget_bytes=icp.ICP_SCORE_SCRATCH_BUDGET_BYTES,
-    )
+    chunk = _decode_chunk(max_model_len, heads_group, token_capacity)
     columns = icp._cdiv(max_model_len, 128)
     tile_bytes = icp.ICP_MSA_QUERY_TILE_TOKENS * heads_group * columns * 5
     assert chunk * heads_group * columns * 5 <= max(
@@ -105,7 +108,7 @@ def test_decode_chunk_is_r13_fixed_budget(max_model_len, token_capacity):
         if size > token_capacity:
             continue
         cap = select_token_capacity(capacities, size)
-        windows = icp.icp_row_windows(
+        windows = local_indexer.icp_row_windows(
             num_tokens=size,
             cap=cap,
             cute_rows=size,
@@ -117,11 +120,7 @@ def test_decode_chunk_is_r13_fixed_budget(max_model_len, token_capacity):
 
 
 def test_decode_chunk_is_128_rows_at_1m():
-    chunk = icp.icp_decode_chunk_tokens(
-        max_model_len=1048576, heads_group=4, token_capacity=MAX_TOKENS
-    )
-    assert chunk == 128
-    assert not hasattr(icp, "_DECODE_CHUNK_ENV")
+    assert _decode_chunk(1048576, 4, MAX_TOKENS) == 128
 
 
 # ---- item 3: one CuTe compile per query length, runtime windows --------------
@@ -135,7 +134,7 @@ def msa_scorer_api():
 
 def test_cute_window_is_the_padded_extent_and_live_requests_only():
     def window(**kw):
-        return icp.icp_cute_decode_window(chunk=1024, **kw)
+        return local_indexer.icp_cute_decode_window(chunk=1024, **kw)
 
     # FULL graph: the padded extent and padded request count, per graph.
     assert window(query_len=1, token_begin=0, rows=24, num_reqs=24) == (0, 24, 0, 24)
@@ -195,7 +194,7 @@ def test_cute_launch_reaches_the_native_scan_with_runtime_window(msa_scorer_api)
     names = ["table", "qsl", "seq", "positions", "active", "scores", "valid"]
     bound = [SimpleNamespace(name=n) for n in names]
     for begin, count in ((0, 16), (512, 64)):
-        run = icp._bind_cute_launch(
+        run = local_indexer.bind_cute_launch(
             scorer.bind(
                 token_begin=begin,
                 token_count=count,
@@ -214,15 +213,14 @@ def test_cute_launch_reaches_the_native_scan_with_runtime_window(msa_scorer_api)
     ]
 
 
-# ---- item 4: validators run once per step unless debugging -------------------
+# ---- item 4: validators run once per step ------------------------------------
 
 
-def _forward_fixture(debug, num_chunks=2):
+def _forward_fixture(num_chunks=2):
     impl = object.__new__(icp.MiniMaxM3IndexerMSAImpl)
     impl.icp_c, impl.icp_rank, impl.prefix = 2, 0, "layer"
     impl.num_index_heads, impl.index_head_dim, impl.scale = 2, 128, 1.0
     impl.topk_indices_buffer = torch.zeros(8, 16, dtype=torch.int32)
-    impl._icp_debug_checks = debug
     launches: list[tuple] = []
     chunks = [
         icp.MiniMaxM3IndexerICPChunk(
@@ -273,9 +271,8 @@ def _forward_fixture(debug, num_chunks=2):
     return impl, md, launches
 
 
-@pytest.mark.parametrize("debug", [False, True])
-def test_per_layer_validators_are_gated_by_the_debug_flag(monkeypatch, debug):
-    impl, md, launches = _forward_fixture(debug)
+def test_per_layer_validators_run_on_the_first_layer_only(monkeypatch):
+    impl, md, launches = _forward_fixture()
     calls = {"invocation": 0, "chunk": 0}
     real_invocation = impl._check_icp_invocation
     real_chunk = impl._check_icp_chunk
@@ -308,15 +305,14 @@ def test_per_layer_validators_are_gated_by_the_debug_flag(monkeypatch, debug):
             layer_idx=layer,
             candidate_exchange=_Exchange(),
         )
-    per_layer = layers if debug else 1
-    assert calls == {"invocation": per_layer, "chunk": 2 * per_layer}
+    assert calls == {"invocation": 1, "chunk": 2}
     assert [layer for layer, _, _ in exchanges] == list(range(layers))
     # The exchange views are bound once per step, not rebuilt per layer.
     assert all(c is md.icp.exchange_candidates for _, c, _ in exchanges)
     assert all(out is exchanges[0][2] for _, _, out in exchanges)
     assert exchanges[0][2].shape[0] == md.icp.token_capacity
     for layer in range(layers):
-        validate = debug or layer == 0
+        validate = layer == 0
         assert launches[4 * layer : 4 * layer + 4] == [
             ("score", 0),
             ("select", 0, validate),
@@ -349,7 +345,7 @@ class _FusedExchange:
 
 
 def test_d3_publishes_every_window_and_padding_before_one_merge_per_layer():
-    impl, md, launches = _forward_fixture(debug=False)
+    impl, md, launches = _forward_fixture()
     st = md.icp
     assert st is not None
     st.fused_decode = st.fused_ready = True
@@ -395,7 +391,7 @@ def test_d3_publishes_every_window_and_padding_before_one_merge_per_layer():
 
 
 def test_d3_missing_fused_binding_fails_before_score_or_exchange():
-    impl, md, launches = _forward_fixture(debug=False)
+    impl, md, launches = _forward_fixture()
     st = md.icp
     assert st is not None
     st.fused_decode = True
@@ -411,13 +407,3 @@ def test_d3_missing_fused_binding_fails_before_score_or_exchange():
             candidate_exchange=_FusedExchange(launches),
         )
     assert launches == []
-
-
-def test_debug_flag_parsing(monkeypatch):
-    monkeypatch.delenv(icp._DEBUG_CHECKS_ENV, raising=False)
-    assert icp._debug_checks_enabled() is False
-    monkeypatch.setenv(icp._DEBUG_CHECKS_ENV, "1")
-    assert icp._debug_checks_enabled() is True
-    monkeypatch.setenv(icp._DEBUG_CHECKS_ENV, "maybe")
-    with pytest.raises(ValueError):
-        icp._debug_checks_enabled()
