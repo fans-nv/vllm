@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Callable
+from typing import Any
 
 import torch
 
@@ -21,6 +23,11 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
 from vllm.model_executor.layers.fused_moe.utils import fi_moe_largest_bucket
+from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe_ugpu import (
+    UgpuMoeLocalization,
+    get_ugpu_moe_localization,
+    reject_pre_processed_ugpu_moe_weights,
+)
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     activation_to_flashinfer_int,
     has_flashinfer_situ_activation,
@@ -41,6 +48,9 @@ logger = init_logger(__name__)
 
 class TrtLlmNvFp4ExpertsBase:
     """NvFp4 TRTLLM-Gen MoE kernels. Supports modular and monolithic interface."""
+
+    # flashinfer_ugpu operator that replaces the FlashInfer one when localized.
+    _ugpu_moe_op_name: str
 
     def __init__(
         self,
@@ -134,6 +144,9 @@ class TrtLlmNvFp4ExpertsBase:
             clamp,
         )
 
+        self.ugpu_moe: UgpuMoeLocalization | None = None
+        self._ugpu_moe_fn: Callable[..., Any] | None = None
+
     def _compute_g1_scale_c(self) -> torch.Tensor:
         assert self.quant_config.g1_alphas is not None
         assert self.quant_config.a2_gscale is not None
@@ -150,6 +163,7 @@ class TrtLlmNvFp4ExpertsBase:
         return self.quant_config.g1_alphas * self.quant_config.a2_gscale
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        reject_pre_processed_ugpu_moe_weights()
         if not is_weights_pre_processed():
             layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
             layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)
@@ -199,6 +213,25 @@ class TrtLlmNvFp4ExpertsBase:
                 torch.nn.Parameter(self.gemm1_alpha, requires_grad=False),
             )
             self.gemm1_alpha = layer.gemm1_alpha
+
+        self.ugpu_moe = get_ugpu_moe_localization(layer)
+        if self.ugpu_moe is not None:
+            import flashinfer_ugpu
+
+            assert not self.per_token_activation
+            self._ugpu_moe_fn = getattr(flashinfer_ugpu, self._ugpu_moe_op_name)
+
+    def _moe_weight_kwargs(self, w1: torch.Tensor, w2: torch.Tensor) -> dict[str, Any]:
+        if self.ugpu_moe is not None:
+            return {"shards": self.ugpu_moe.shards, "runtime": self.ugpu_moe.runtime}
+        assert self.quant_config.w1_scale is not None
+        assert self.quant_config.w2_scale is not None
+        return {
+            "gemm1_weights": w1,
+            "gemm1_weights_scale": self.quant_config.w1_scale.view(torch.float8_e4m3fn),
+            "gemm2_weights": w2,
+            "gemm2_weights_scale": self.quant_config.w2_scale.view(torch.float8_e4m3fn),
+        }
 
     @staticmethod
     def _supports_current_device() -> bool:
@@ -292,10 +325,26 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
         # Each launch permutes into its own buffer, so a chunked call finalizes.
         moe_config.limit_deferred_moe_finalize(self._get_chunk_size())
 
+    _ugpu_moe_op_name = "trtllm_fp4_block_scale_routed_moe_ugpu"
+
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
         """The modular implementation supports all parallel configs."""
         return True
+
+    def moe_problem_size(
+        self,
+        a1: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[int, int, int, int, int]:
+        E, M, N, K, topk = super().moe_problem_size(a1, w1, w2, topk_ids)
+        if self.ugpu_moe is not None and self.ugpu_moe.full_weights_released:
+            # w1 is a zero-width placeholder; the shards hold the real rows.
+            N = 2 * self.intermediate_size_per_partition
+            assert N > 0
+        return E, M, N, K, topk
 
     def workspace_shapes(
         self,
@@ -350,21 +399,21 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
         output1_scale_gate_scalar = self.quant_config.g1_alphas
 
         # Invoke kernel.
-        flashinfer_output = flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe(
+        moe_fn = (
+            self._ugpu_moe_fn or flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe
+        )
+        flashinfer_output = moe_fn(
             topk_ids=(topk_ids, topk_weights),
             routing_bias=None,
             hidden_states=hidden_states,
             hidden_states_scale=block_scale.view(torch.float8_e4m3fn).reshape(
                 *hidden_states.shape[:-1], -1
             ),
-            gemm1_weights=w1,
-            gemm1_weights_scale=self.quant_config.w1_scale.view(torch.float8_e4m3fn),
+            **self._moe_weight_kwargs(w1, w2),
             gemm1_bias=None,
             gemm1_alpha=self.gemm1_alpha,
             gemm1_beta=self.gemm1_beta,
             gemm1_clamp_limit=self.gemm1_clamp_limit,
-            gemm2_weights=w2,
-            gemm2_weights_scale=self.quant_config.w2_scale.view(torch.float8_e4m3fn),
             gemm2_bias=None,
             output1_scale_scalar=self.g1_scale_c,
             output1_scale_gate_scalar=output1_scale_gate_scalar,
@@ -463,6 +512,8 @@ class TrtLlmNvFp4ExpertsMonolithic(
 ):
     """Monolithic version of the kernel (router + experts)."""
 
+    _ugpu_moe_op_name = "trtllm_fp4_block_scale_moe_ugpu"
+
     def supports_routing_replay_capture(self) -> bool:
         return True
 
@@ -549,21 +600,19 @@ class TrtLlmNvFp4ExpertsMonolithic(
         # Invoke kernel.
         # NOTE: Activation padding and output
         # truncation are handled by the MoE runner's
-        flashinfer_output = flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
+        moe_fn = self._ugpu_moe_fn or flashinfer.fused_moe.trtllm_fp4_block_scale_moe
+        flashinfer_output = moe_fn(
             routing_logits=router_logits,
             routing_bias=e_score_correction_bias,
             hidden_states=hidden_states,
             hidden_states_scale=block_scale.view(torch.float8_e4m3fn).reshape(
                 *hidden_states.shape[:-1], -1
             ),
-            gemm1_weights=w1,
-            gemm1_weights_scale=self.quant_config.w1_scale.view(torch.float8_e4m3fn),
+            **self._moe_weight_kwargs(w1, w2),
             gemm1_bias=None,
             gemm1_alpha=self.gemm1_alpha,
             gemm1_beta=self.gemm1_beta,
             gemm1_clamp_limit=self.gemm1_clamp_limit,
-            gemm2_weights=w2,
-            gemm2_weights_scale=self.quant_config.w2_scale.view(torch.float8_e4m3fn),
             gemm2_bias=None,
             output1_scale_scalar=self.g1_scale_c,
             output1_scale_gate_scalar=output1_scale_gate_scalar,
