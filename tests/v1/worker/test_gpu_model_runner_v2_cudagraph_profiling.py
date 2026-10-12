@@ -127,6 +127,84 @@ def test_profile_cudagraph_memory_disabled_returns_zero(monkeypatch):
     assert runner.events == []
 
 
+def test_profiling_teardown_releases_cache_aliases_but_keeps_model_resources(
+    monkeypatch,
+):
+    events: list[str] = []
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.kv_cache = torch.zeros(16)
+            self.reader_view: torch.Tensor | None = self.kv_cache.view(2, 8)
+
+        def release_kv_cache(self):
+            assert runner.cudagraph_manager is None
+            self.reader_view = None
+            events.append("release_alias")
+
+    class Model(torch.nn.Sequential):
+        def shutdown_model_resources(self):
+            pytest.fail("profiling must preserve model-scoped peer resources")
+
+    layer = Layer()
+    runner: Any = SimpleNamespace(
+        model=Model(layer),
+        model_state=SimpleNamespace(supports_mm_inputs=False),
+        compilation_config=SimpleNamespace(static_forward_context={"attn": layer}),
+        cudagraph_manager=object(),
+        kv_caches={"attn": layer.kv_cache},
+        cache_config=SimpleNamespace(num_gpu_blocks=1),
+        lora_config=None,
+        maybe_remove_all_loras=lambda _: None,
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+
+    cgu._teardown_profiling_state(runner)
+
+    assert "release_alias" in events
+    assert layer.kv_cache.numel() == 0
+    assert layer.reader_view is None
+
+
+def test_shutdown_closes_model_resources_once_after_drain_before_cache_release(
+    monkeypatch,
+):
+    events = []
+    runner = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
+    runner.cudagraph_manager = object()
+    runner.vllm_config = SimpleNamespace()
+    runner.aux_output_connector = None
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.kv_cache = torch.zeros(1)
+
+        def release_kv_cache(self):
+            events.append("release_cache")
+
+    class Model(torch.nn.Sequential):
+        def shutdown_model_resources(self):
+            assert runner.cudagraph_manager is None
+            events.append("close_peer")
+
+    model = Model(Layer())
+    runner.model = model
+    # A draft that shares the target root must not close it twice.
+    runner.speculator = SimpleNamespace(model=model)
+    monkeypatch.setattr(
+        torch.accelerator, "synchronize", lambda: events.append("drain")
+    )
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(mrv2, "free_before_shutdown", lambda _: None)
+    runner.shutdown()
+    assert events[:2] == ["drain", "close_peer"]
+    assert events.count("close_peer") == 1
+    assert set(events[2:]) == {"release_cache"}
+
+
 def test_profile_cudagraph_memory_no_graphs_tears_down(monkeypatch):
     _patch_module(monkeypatch)
     runner = _make_profiling_runner(CUDAGraphMode.FULL, needs_capture=False)

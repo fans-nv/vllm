@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from tests.v1.worker.test_gpu_batch_ordering import _make_runner as _make_batch_runner
 from vllm.config import (
     CompilationConfig,
     CUDAGraphMode,
@@ -331,6 +332,48 @@ def _make_spec_decode_manager(
     )
     manager._graphs_captured = True
     return manager
+
+
+@pytest.mark.parametrize("exclude_prefill", [False, True])
+@pytest.mark.parametrize("query_len", [1, 4])
+def test_promoted_prompt_tail_skips_phase_specific_decode_graph(
+    monkeypatch, exclude_prefill, query_len
+):
+    """A decode-shaped prompt tail is uniform but still a prefill.
+
+    Builders with ``cudagraph_decode_phase_only`` make execute_model drop the
+    uniform count for such batches, so dispatch falls back to PIECEWISE.
+    """
+    runner = _make_batch_runner(
+        {"decode": (16, 16), "tail": (128, 129)}, decode_query_len=query_len
+    )
+    scheduled = SimpleNamespace(
+        num_scheduled_tokens={"decode": query_len, "tail": query_len},
+        total_num_scheduled_tokens=2 * query_len,
+        scheduled_spec_decode_tokens={
+            "decode": [-1] * (query_len - 1),
+            "tail": [-1] * (query_len - 1),
+        },
+    )
+    state, uniform_count = runner.gather_batch_req_state(scheduled, False)
+    assert state.has_prefill and state.decode_graph_eligible
+    assert uniform_count == query_len
+    if exclude_prefill:  # GPUModelRunner.execute_model
+        uniform_count = None
+    manager = _make_spec_decode_manager(
+        monkeypatch, decode_query_len=query_len, capture_sizes=[4, 8]
+    )
+    desc, _ = dispatch_cg_and_sync_dp(
+        manager,
+        num_reqs=2,
+        num_tokens=state.num_tokens,
+        uniform_token_count=uniform_count,
+        dp_size=1,
+        dp_rank=0,
+        max_query_len=None,
+    )
+    expected = CUDAGraphMode.PIECEWISE if exclude_prefill else CUDAGraphMode.FULL
+    assert desc.cg_mode == expected
 
 
 def test_uniform_decode_pads_up_to_full_graph(monkeypatch):
