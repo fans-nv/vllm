@@ -93,6 +93,12 @@ __device__ __forceinline__ uint8_t rocm_cvt_float_to_fp8_e4m3(float val) {
 }
 #endif
 
+#if !defined(USE_ROCM) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+  #define VLLM_MINIMAX_M3_NVFP4
+#endif
+
+#include "fused_minimax_m3_icp.cuh"
+
 namespace vllm {
 namespace minimax_m3_fused_ops {
 
@@ -125,7 +131,7 @@ __device__ __forceinline__ float warpReduceSum(float val) {
 // back to scalar_t like the materialized unfused norm output, followed by
 // partial NeoX RoPE on the leading ``rotary_dim`` dims. Each lane owns
 // ``kElemsPerLane`` contiguous dims [laneId*4, laneId*4+4).
-template <typename scalar_t>
+template <typename scalar_t, bool kVectorWeight = false>
 __device__ __forceinline__ void normAndRope(
     float (&elems)[kElemsPerLane], int const laneId, float const eps,
     scalar_t const* __restrict__ weight,  // [kHeadDim] or nullptr (no norm)
@@ -139,11 +145,26 @@ __device__ __forceinline__ void normAndRope(
     for (int i = 0; i < kElemsPerLane; i++) sumsq += elems[i] * elems[i];
     sumsq = warpReduceSum(sumsq);
     float const rms_rcp = rsqrtf(sumsq / static_cast<float>(kHeadDim) + eps);
+    if constexpr (kVectorWeight) {
+      using Converter = vllm::_typeConvert<scalar_t>;
+      uint2 const weights =
+          *reinterpret_cast<uint2 const*>(weight + laneId * kElemsPerLane);
+      auto const* packed =
+          reinterpret_cast<typename Converter::packed_hip_type const*>(
+              &weights);
 #pragma unroll
-    for (int i = 0; i < kElemsPerLane; i++) {
-      int const dim = laneId * kElemsPerLane + i;
-      float const w = 1.0f + static_cast<float>(weight[dim]);
-      elems[i] = elems[i] * rms_rcp * w;
+      for (int i = 0; i < kElemsPerLane / 2; ++i) {
+        float2 const w = Converter::convert(packed[i]);
+        elems[2 * i] = elems[2 * i] * rms_rcp * (1.0f + w.x);
+        elems[2 * i + 1] = elems[2 * i + 1] * rms_rcp * (1.0f + w.y);
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < kElemsPerLane; i++) {
+        int const dim = laneId * kElemsPerLane + i;
+        float const w = 1.0f + static_cast<float>(weight[dim]);
+        elems[i] = elems[i] * rms_rcp * w;
+      }
     }
   }
 
@@ -247,6 +268,7 @@ __device__ __forceinline__ void storeCacheElems(
 // saturating to ±448). Used for the fp8 indexer-Q / index-K outputs; no scale
 // (RMSNorm outputs are O(1) and the score path only needs relative block
 // ordering).
+template <bool kPreserveNaN = false>
 __device__ __forceinline__ void storeElemsFp8(
     uint8_t* __restrict__ dst, float const (&elems)[kElemsPerLane]) {
   constexpr float kFp8Max = 448.0f;
@@ -255,8 +277,10 @@ __device__ __forceinline__ void storeElemsFp8(
   #pragma unroll
   for (int i = 0; i < kElemsPerLane / 2; i++) {
     float2 vv = make_float2(elems[2 * i], elems[2 * i + 1]);
-    vv.x = fminf(fmaxf(vv.x, -kFp8Max), kFp8Max);
-    vv.y = fminf(fmaxf(vv.y, -kFp8Max), kFp8Max);
+    if constexpr (!kPreserveNaN) {
+      vv.x = fminf(fmaxf(vv.x, -kFp8Max), kFp8Max);
+      vv.y = fminf(fmaxf(vv.y, -kFp8Max), kFp8Max);
+    }
     out2[i] = __nv_cvt_float2_to_fp8x2(vv, __NV_SATFINITE, __NV_E4M3);
   }
   *reinterpret_cast<uint32_t*>(dst) = *reinterpret_cast<uint32_t const*>(out2);
@@ -271,7 +295,7 @@ __device__ __forceinline__ void storeElemsFp8(
 
 // Match scaled_fp8_quant(q_out): materialize q in scalar_t before applying the
 // inverse dequantization scale and converting it to E4M3.
-template <typename scalar_t>
+template <typename scalar_t, bool kIcp = false>
 __device__ __forceinline__ void storeScaledQElemsFp8(
     uint8_t* __restrict__ dst, float const (&elems)[kElemsPerLane],
     float const inv_scale) {
@@ -280,9 +304,13 @@ __device__ __forceinline__ void storeScaledQElemsFp8(
 #pragma unroll
   for (int i = 0; i < kElemsPerLane; i++) {
     auto const rounded = Converter::convert(elems[i]);
-    scaled[i] = static_cast<float>(rounded) * inv_scale;
+    if constexpr (kIcp) {
+      scaled[i] = static_cast<float>(rounded);  // ICP requires unit Q scale.
+    } else {
+      scaled[i] = static_cast<float>(rounded) * inv_scale;
+    }
   }
-  storeElemsFp8(dst, scaled);
+  storeElemsFp8<kIcp>(dst, scaled);
 }
 
 // index_q: E4M3(scalar_t(v)) with unit scale, i.e. q is rounded to the model
@@ -424,14 +452,88 @@ __device__ __forceinline__ uint16_t clearNegZeroNibbles(uint16_t packed) {
   return packed & (((packed & 0x7777u) + 0x7777u) | 0x7777u);
 }
 
+  #ifdef VLLM_MINIMAX_M3_NVFP4
+__device__ __forceinline__ float nvfp4Reciprocal(float value) {
+  float result;
+  asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(value));
+  return result;
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ uint16_t
+quantizeNvfp4Quad(float const (&elems)[kElemsPerLane], float const sf_scale,
+                  uint8_t& sf_value) {
+  using Converter = vllm::_typeConvert<scalar_t>;
+  using packed_t = typename Converter::packed_hip_type;
+  packed_t rounded[kElemsPerLane / 2];
+    #pragma unroll
+  for (int i = 0; i < kElemsPerLane / 2; i++) {
+    rounded[i] =
+        Converter::convert(make_float2(elems[2 * i], elems[2 * i + 1]));
+  }
+  packed_t local_max = __hmax2(__habs2(rounded[0]), __habs2(rounded[1]));
+  local_max = __hmax2(__shfl_xor_sync(FINAL_MASK, local_max, 1), local_max);
+  local_max = __hmax2(__shfl_xor_sync(FINAL_MASK, local_max, 2), local_max);
+  float const amax = Converter::convert(__hmax(local_max.x, local_max.y));
+  float scale = sf_scale * (amax * nvfp4Reciprocal(6.0f));
+  sf_value = __nv_cvt_float_to_fp8(scale, __NV_SATFINITE, __NV_E4M3);
+  __half_raw const sf_half = __nv_cvt_fp8_to_halfraw(sf_value, __NV_E4M3);
+  scale = __half2float(__ushort_as_half(sf_half.x));
+  float const output_scale =
+      scale != 0.0f ? nvfp4Reciprocal(scale * nvfp4Reciprocal(sf_scale)) : 0.0f;
+  float2 values[kElemsPerLane / 2];
+    #pragma unroll
+  for (int i = 0; i < kElemsPerLane / 2; i++) {
+    values[i] = Converter::convert(rounded[i]);
+    values[i].x *= output_scale;
+    values[i].y *= output_scale;
+  }
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && \
+        (defined(__CUDA_ARCH_SPECIFIC__) ||                \
+         defined(__CUDA_ARCH_FAMILY_SPECIFIC__))
+  uint32_t packed;
+  asm volatile(
+      "{\n"
+      ".reg .b8 byte0, byte1;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte1, %4, %3;\n"
+      "mov.b32 %0, {byte0, byte1, byte0, byte1};\n"
+      "}\n"
+      : "=r"(packed)
+      : "f"(values[0].x), "f"(values[0].y), "f"(values[1].x), "f"(values[1].y));
+  return static_cast<uint16_t>(packed);
+    #else
+  // The host rejects NVFP4 on older devices; keep their existing formats built.
+  __trap();
+  return 0;
+    #endif
+}
+  #endif
+
+// Writes one lane's packed E2M1 nibbles and group scale into its HND slot.
+__device__ __forceinline__ void storeNvfp4Slot(
+    uint8_t* __restrict__ page, int const kv, int const head, int const token,
+    int const block_size, int const laneId, uint8_t const sf_byte,
+    uint16_t const packed);
+
 // Quantize one K or V head row of one token into its NVFP4 page, where
 // ``scale`` is the dequantization (global) scale. Every lane of the warp must
 // call this (the scale-group reductions shuffle).
-template <typename scalar_t>
+template <typename scalar_t, bool kIcp = false>
 __device__ __forceinline__ void storeNvfp4CacheElems(
     uint8_t* __restrict__ page, int const kv, int const head, int const token,
     int const block_size, int const laneId, float const (&elems)[kElemsPerLane],
     float const scale) {
+  #ifdef VLLM_MINIMAX_M3_NVFP4
+  if constexpr (kIcp) {
+    // ICP keeps its qualified reciprocal-multiply quantization.
+    uint8_t sf_byte;
+    uint16_t const packed =
+        quantizeNvfp4Quad<scalar_t>(elems, nvfp4Reciprocal(scale), sf_byte);
+    storeNvfp4Slot(page, kv, head, token, block_size, laneId, sf_byte, packed);
+    return;
+  }
+  #endif
   // Quantize the model-dtype value that the unfused path reads back from qkv.
   using Converter = vllm::_typeConvert<scalar_t>;
   float x[kElemsPerLane];
@@ -517,7 +619,13 @@ __device__ __forceinline__ void storeNvfp4CacheElems(
   packed = static_cast<uint16_t>(codes);
   #endif
   packed = clearNegZeroNibbles(packed);
+  storeNvfp4Slot(page, kv, head, token, block_size, laneId, sf_byte, packed);
+}
 
+__device__ __forceinline__ void storeNvfp4Slot(
+    uint8_t* __restrict__ page, int const kv, int const head, int const token,
+    int const block_size, int const laneId, uint8_t const sf_byte,
+    uint16_t const packed) {
   uint8_t* const slot = page + static_cast<int64_t>(2 * head + kv) *
                                    block_size *
                                    (kNvfp4DataBytes + kNvfp4ScaleBytes);
@@ -564,8 +672,9 @@ __device__ __forceinline__ void storeNvfp4CacheElems(
 // kHasIndex=true but set kProcessIndex=false.
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt,
           bool kNvfp4, typename out_idx_t, bool kHasIndex, bool kInsertKV,
-          bool kProcessIndex, bool kFp8Idx>
-__global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
+          bool kProcessIndex, bool kFp8Idx, bool kIcp = false,
+          bool kFlatRow = false, bool kWriteMeta = false>
+__device__ __forceinline__ void fusedMiniMaxM3Body(
     scalar_t* __restrict__ qkv,  // [N, qkv_row] in/out (packs index if sparse)
     scalar_t* __restrict__ q_out,         // [N, nq*128] contiguous, or nullptr
     uint8_t* __restrict__ q_fp8_out,      // [N, nq*128] E4M3, or nullptr
@@ -589,8 +698,8 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
     int64_t const kv_s_block, int64_t const kv_s_head, int64_t const kv_s_token,
     int64_t const kv_s_dim,
     // NVFP4 main cache only: per-layer K/V dequantization (global) scales.
-    float const* __restrict__ kv_k_scale,
-    float const* __restrict__ kv_v_scale) {
+    float const* __restrict__ kv_k_scale, float const* __restrict__ kv_v_scale,
+    IcpWriterParams const icp) {
 #if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800) && !defined(USE_ROCM)
   // _typeConvert<BFloat16> is unavailable on pre-Ampere; the M3 kernel only
   // runs with bf16/fp16 inputs in practice.  Discard the bf16 body there.
@@ -598,9 +707,28 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
     return;
   } else {
 #endif
+    // Head CTAs publish ICP live metadata and ABI-3 work in this grid.
+    if constexpr (kIcp && kWriteMeta) {
+#ifdef VLLM_MINIMAX_M3_NVFP4
+      if (blockIdx.x < static_cast<unsigned>(icp.metadata.meta_blocks)) {
+        icpLiveMetadataBlock(icp.metadata);
+        return;
+      }
+      if (blockIdx.x < static_cast<unsigned>(icp.metadata.meta_blocks +
+                                             icp.metadata.plan.blocks)) {
+        icpDevicePlanBlock(icp.metadata, static_cast<int>(blockIdx.x) -
+                                             icp.metadata.meta_blocks);
+        return;
+      }
+#endif
+    }
     int const warpsPerBlock = blockDim.x / 32;
     int const laneId = threadIdx.x % 32;
-    int const globalWarpIdx = blockIdx.x * warpsPerBlock + (threadIdx.x / 32);
+    int const metadata_blocks =
+        kWriteMeta ? icp.metadata.meta_blocks + icp.metadata.plan.blocks : 0;
+    int const globalWarpIdx =
+        (blockIdx.x - static_cast<unsigned>(metadata_blocks)) * warpsPerBlock +
+        (threadIdx.x / 32);
 
     static_assert(!kProcessIndex || kHasIndex,
                   "index processing requires sparse row layout");
@@ -644,7 +772,16 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
     bool do_rope = true;
     int head = 0;  // kv head index for inserts
 
-    if (isQ) {
+    if constexpr (kFlatRow) {
+      // Branch-free selection; every slot is a flat row in the ICP layout.
+      static_assert(kIcp && kInsertKV && kProcessIndex && kHasIndex);
+      row_ptr =
+          qkv + static_cast<int64_t>(tokenIdx) * qkv_row + slot * kHeadDim;
+      norm_w =
+          isQ ? q_norm_w : (isK ? k_norm_w : (isIQ ? iq_norm_w : ik_norm_w));
+      do_rope = !isV;
+      head = isK ? (slot - k_begin) : (slot - v_begin);
+    } else if (isQ) {
       row_ptr =
           qkv + static_cast<int64_t>(tokenIdx) * qkv_row + slot * kHeadDim;
       norm_w = q_norm_w;
@@ -686,7 +823,7 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
     if (isQ && q_out != nullptr) {
       store_ptr = q_out + static_cast<int64_t>(tokenIdx) * nq * kHeadDim +
                   slot * kHeadDim;
-    } else if (isQ && q_fp8_out != nullptr) {
+    } else if (!kIcp && isQ && q_fp8_out != nullptr) {
       store_ptr = nullptr;
     } else if (isIQ && index_q_out != nullptr) {
       // bf16 index_q_out: gather here. fp8: written by the explicit fp8 store.
@@ -719,8 +856,61 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
     if (!isV) {
       int64_t const pos = positions[tokenIdx];
       scalar_t const* cos_ptr = cos_sin_cache + pos * rotary_dim;
-      normAndRope<scalar_t>(elems, laneId, eps, norm_w, do_rope, rotary_dim,
-                            cos_ptr, /*apply_norm=*/norm_w != nullptr);
+      normAndRope<scalar_t, kIcp>(elems, laneId, eps, norm_w, do_rope,
+                                  rotary_dim, cos_ptr,
+                                  /*apply_norm=*/norm_w != nullptr);
+    }
+    if constexpr (kIcp) {
+      if (isQ) {
+        storeElems<scalar_t>(store_ptr + dim_base, elems);
+        if (q_fp8_out != nullptr) {
+          storeScaledQElemsFp8<scalar_t, true>(
+              q_fp8_out + static_cast<int64_t>(tokenIdx) * nq * kHeadDim +
+                  slot * kHeadDim + dim_base,
+              elems, q_fp8_inv_scale);
+        }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+        cudaTriggerProgrammaticLaunchCompletion();
+#endif
+        return;
+      }
+      if (isIQ) {
+        if (index_q_out != nullptr) {
+          storeElemsFp8<true>(
+              reinterpret_cast<uint8_t*>(index_q_out) +
+                  static_cast<int64_t>(tokenIdx) * niq * kHeadDim +
+                  (slot - iq_begin) * kHeadDim + dim_base,
+              elems);
+        } else {
+          storeElems<scalar_t>(store_ptr + dim_base, elems);
+        }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+        cudaTriggerProgrammaticLaunchCompletion();
+#endif
+        return;
+      }
+      if (isIK) {
+        storeElems<scalar_t>(store_ptr + dim_base, elems);
+        if (index_cache != nullptr) {
+          int64_t const sm = slot_mapping[tokenIdx];
+          if (sm >= 0) {
+            int const u = static_cast<int>(sm % icp.block_tokens);
+            if (u / icp.rows_per_rank == icp.rank) {
+              int64_t const offset = (sm / icp.block_tokens) * icp.page_stride +
+                                     (u % icp.rows_per_rank) * icp.row_stride;
+              storeElemsFp8<true>(
+                  reinterpret_cast<uint8_t*>(index_cache) + offset + dim_base,
+                  elems);
+            }
+          }
+        }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+        cudaTriggerProgrammaticLaunchCompletion();
+#endif
+        return;
+      }
+      if (isK) storeElems<scalar_t>(store_ptr + dim_base, elems);
+    } else if (!isV) {
       if constexpr (kFp8Idx) {
         // index_q is E4M3(scalar_t(q)) bytes; Q/K (and in-place index_k) stay
         // scalar_t.
@@ -763,7 +953,7 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
 #ifndef USE_ROCM
           // kv_cache is [num_blocks, 2*nkv, block_size, 72] bytes (HND), slot
           // 2*head + side; kv_s_block is its page stride.
-          storeNvfp4CacheElems<scalar_t>(
+          storeNvfp4CacheElems<scalar_t, kIcp>(
               reinterpret_cast<uint8_t*>(kv_cache) +
                   (sm / block_size) * kv_s_block,
               isK ? 0 : 1, head, static_cast<int>(sm % block_size), block_size,
@@ -794,6 +984,74 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
 #endif
 }
 
+template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt,
+          bool kNvfp4, typename out_idx_t, bool kHasIndex, bool kInsertKV,
+          bool kProcessIndex, bool kFp8Idx>
+__global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
+    scalar_t* __restrict__ qkv,  // [N, qkv_row] in/out (packs index if sparse)
+    scalar_t* __restrict__ q_out,         // [N, nq*128] contiguous, or nullptr
+    uint8_t* __restrict__ q_fp8_out,      // [N, nq*128] E4M3, or nullptr
+    out_idx_t* __restrict__ index_q_out,  // [N, niq*128]; scalar_t or e4m3 byte
+    scalar_t const* __restrict__ q_norm_w,
+    scalar_t const* __restrict__ k_norm_w,
+    scalar_t const* __restrict__ iq_norm_w,
+    scalar_t const* __restrict__ ik_norm_w,
+    scalar_t const* __restrict__ cos_sin_cache,  // [max_pos, rotary_dim]
+    int64_t const* __restrict__ positions,       // [N] i64
+    int64_t const* __restrict__ slot_mapping,    // main K/V slots or nullptr
+    int64_t const* __restrict__ index_slot_mapping,  // index K slots/nullptr
+    cache_t* __restrict__ kv_cache,       // [nb,nkv,bs,2*128] or nullptr
+    out_idx_t* __restrict__ index_cache,  // [nb*bs, 128]; scalar_t or e4m3 byte
+    float const eps, float const q_fp8_inv_scale, int const rotary_dim,
+    int const num_tokens, int const nq, int const nkv, int const niq,
+    int const block_size,
+    // kv_cache strides (in elements) for logical shape [nb, nkv, bs, 2*128].
+    // The content (last) dim is always innermost-contiguous (stride 1), so the
+    // NHD/HND layout choice is captured by the head/token strides.
+    int64_t const kv_s_block, int64_t const kv_s_head, int64_t const kv_s_token,
+    int64_t const kv_s_dim,
+    // NVFP4 main cache only: per-layer K/V dequantization (global) scales.
+    float const* __restrict__ kv_k_scale,
+    float const* __restrict__ kv_v_scale) {
+  fusedMiniMaxM3Body<scalar_t, cache_t, kv_dt, kNvfp4, out_idx_t, kHasIndex,
+                     kInsertKV, kProcessIndex, kFp8Idx>(
+      qkv, q_out, q_fp8_out, index_q_out, q_norm_w, k_norm_w, iq_norm_w,
+      ik_norm_w, cos_sin_cache, positions, slot_mapping, index_slot_mapping,
+      kv_cache, index_cache, eps, q_fp8_inv_scale, rotary_dim, num_tokens, nq,
+      nkv, niq, block_size, kv_s_block, kv_s_head, kv_s_token, kv_s_dim,
+      kv_k_scale, kv_v_scale, IcpWriterParams{});
+}
+
+#ifdef VLLM_MINIMAX_M3_NVFP4
+// Keep the qualified ICP occupancy contract on its opt-in entry only.
+template <typename scalar_t, bool kInsertKV, bool kFlatRow, bool kWriteMeta>
+__global__ __launch_bounds__(256, 8) void fusedMiniMaxM3IcpKernel(
+    scalar_t* __restrict__ qkv, scalar_t* __restrict__ q_out,
+    uint8_t* __restrict__ q_fp8_out, uint8_t* __restrict__ index_q_out,
+    scalar_t const* __restrict__ q_norm_w,
+    scalar_t const* __restrict__ k_norm_w,
+    scalar_t const* __restrict__ iq_norm_w,
+    scalar_t const* __restrict__ ik_norm_w,
+    scalar_t const* __restrict__ cos_sin_cache,
+    int64_t const* __restrict__ positions,
+    int64_t const* __restrict__ slot_mapping, uint8_t* __restrict__ kv_cache,
+    uint8_t* __restrict__ index_cache, float const eps,
+    float const q_fp8_inv_scale, int const rotary_dim, int const num_tokens,
+    int const nq, int const nkv, int const niq, int const block_size,
+    int64_t const kv_s_block, int64_t const kv_s_head, int64_t const kv_s_token,
+    int64_t const kv_s_dim, float const* __restrict__ k_scale,
+    float const* __restrict__ v_scale, IcpWriterParams const icp) {
+  fusedMiniMaxM3Body<scalar_t, uint8_t, Fp8KVCacheDataType::kAuto, kInsertKV,
+                     uint8_t, true, kInsertKV, true, true, true, kFlatRow,
+                     kWriteMeta>(
+      qkv, q_out, q_fp8_out, index_q_out, q_norm_w, k_norm_w, iq_norm_w,
+      ik_norm_w, cos_sin_cache, positions, slot_mapping, nullptr, kv_cache,
+      index_cache, eps, q_fp8_inv_scale, rotary_dim, num_tokens, nq, nkv, niq,
+      block_size, kv_s_block, kv_s_head, kv_s_token, kv_s_dim, k_scale, v_scale,
+      icp);
+}
+#endif
+
 // ────────────────────────────────────────────────────────────────────────────
 // Launch wrapper
 // ────────────────────────────────────────────────────────────────────────────
@@ -811,7 +1069,7 @@ void launchFusedMiniMaxM3(
     int64_t const kv_s_block, int64_t const kv_s_head, int64_t const kv_s_token,
     int64_t const kv_s_dim, bool const has_index, bool const insert_kv,
     bool const process_index, bool const fp8_idx, float const* kv_k_scale,
-    float const* kv_v_scale, cudaStream_t stream) {
+    float const* kv_v_scale, cudaStream_t stream, IcpWriterParams const& icp) {
   // Index outputs are scalar_t (bf16) or e4m3 bytes (uint8_t); reinterpret the
   // void* pointers per instantiation in the LAUNCH macro.
   // Slot count must match the kernel's compile-time gating.
@@ -823,8 +1081,10 @@ void launchFusedMiniMaxM3(
   constexpr int kWarpsPerBlock = kBlockSize / 32;
   int64_t const total_warps =
       static_cast<int64_t>(num_tokens) * slots_per_token;
-  int const grid =
+  int const main_grid =
       static_cast<int>((total_warps + kWarpsPerBlock - 1) / kWarpsPerBlock);
+  int const grid =
+      main_grid + icp.metadata.meta_blocks + icp.metadata.plan.blocks;
   if (grid == 0) return;
 
 #ifndef USE_ROCM
@@ -841,7 +1101,43 @@ void launchFusedMiniMaxM3(
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attrs[0].val.programmaticStreamSerializationAllowed = 1;
   config.attrs = attrs;
-  config.numAttrs = (sm_version >= 90) ? 1 : 0;
+  // ICP live-metadata consumers read before their wait: never PDL there.
+  config.numAttrs = (icp.world_size == 0 && sm_version >= 90) ? 1 : 0;
+
+  #ifdef VLLM_MINIMAX_M3_NVFP4
+  if (icp.world_size != 0) {
+    cudaError_t launch_status = cudaSuccess;
+    #define LAUNCH_ICP(INSERT, FLAT, META)                                     \
+      launch_status = cudaLaunchKernelEx(                                      \
+          &config, fusedMiniMaxM3IcpKernel<scalar_t, INSERT, FLAT, META>, qkv, \
+          q_out, q_fp8_out, reinterpret_cast<uint8_t*>(index_q_out), q_norm_w, \
+          k_norm_w, iq_norm_w, ik_norm_w, cos_sin_cache, positions,            \
+          slot_mapping, reinterpret_cast<uint8_t*>(kv_cache),                  \
+          reinterpret_cast<uint8_t*>(index_cache), eps, q_fp8_inv_scale,       \
+          rotary_dim, num_tokens, nq, nkv, niq, block_size, kv_s_block,        \
+          kv_s_head, kv_s_token, kv_s_dim, kv_k_scale, kv_v_scale, icp)
+    if (insert_kv) {
+      if (num_tokens >= 1024) {
+        if (icp.metadata.meta_blocks > 0) {
+          LAUNCH_ICP(true, true, true);
+        } else {
+          LAUNCH_ICP(true, true, false);
+        }
+      } else if (icp.metadata.meta_blocks > 0) {
+        LAUNCH_ICP(true, false, true);
+      } else {
+        LAUNCH_ICP(true, false, false);
+      }
+    } else {
+      LAUNCH_ICP(false, false, false);
+    }
+    #undef LAUNCH_ICP
+    STD_TORCH_CHECK(launch_status == cudaSuccess,
+                    "fused MiniMax-M3 ICP writer launch failed: ",
+                    cudaGetErrorString(launch_status));
+    return;
+  }
+  #endif
 
   #define LAUNCH(HAS_INDEX, INSERT, PROCESS_INDEX, FP8, OUT_T)              \
     cudaLaunchKernelEx(                                                     \
@@ -949,7 +1245,7 @@ void launchFusedMiniMaxM3(
       static_cast<int>(rotary_dim), num_tokens, nq, nkv, niq,                  \
       static_cast<int>(block_size), kv_s_block, kv_s_head, kv_s_token,         \
       kv_s_dim, has_index, insert_kv, process_index, fp8_idx, kv_k_scale_ptr,  \
-      kv_v_scale_ptr, stream)
+      kv_v_scale_ptr, stream, icp)
 #define CALL_FUSED_MINIMAX_M3(_RAW_T, CACHE_T, KV_DTYPE)                       \
   CALL_FUSED_MINIMAX_M3_IMPL(CACHE_T, KV_DTYPE, false)
 // clang-format on
@@ -980,7 +1276,25 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
         q_fp8_out,  // [N, nq*128] contiguous E4M3
     double q_fp8_scale,
     std::optional<torch::stable::Tensor> kv_k_scale,  // [] f32, NVFP4 only
-    std::optional<torch::stable::Tensor> kv_v_scale) {
+    std::optional<torch::stable::Tensor> kv_v_scale, int64_t index_rank,
+    int64_t index_world_size, bool write_icp_metadata,
+    std::optional<torch::stable::Tensor> icp_query_start_loc,
+    std::optional<torch::stable::Tensor> icp_seq_lens, int64_t icp_num_reqs,
+    std::optional<torch::stable::Tensor> icp_positions,
+    std::optional<torch::stable::Tensor> icp_active,
+    std::optional<torch::stable::Tensor> icp_local_nvalid,
+    std::optional<torch::stable::Tensor> icp_local_forced,
+    std::optional<torch::stable::Tensor> icp_global_nvalid,
+    std::optional<torch::stable::Tensor> icp_forced,
+    std::optional<torch::stable::Tensor> icp_n_ordinary,
+    std::optional<torch::stable::Tensor> icp_candidates,
+    std::optional<torch::stable::Tensor> icp_qo_offsets,
+    int64_t icp_chunk_width,
+    std::optional<torch::stable::Tensor> icp_plan_segments,
+    std::optional<torch::stable::Tensor> icp_plan_work,
+    std::optional<torch::stable::Tensor> icp_plan_header,
+    int64_t icp_plan_num_ctas, int64_t icp_plan_num_heads,
+    int64_t icp_plan_abi) {
   STD_TORCH_CHECK(qkv.is_cuda() && qkv.is_contiguous(),
                   "qkv must be contiguous CUDA");
   STD_TORCH_CHECK(
@@ -1181,16 +1495,289 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
         "fp8 index path: index_q_out must be fp8 e4m3");
   }
 
-  STD_TORCH_CHECK(!nvfp4_kv || insert_kv,
+  vllm::minimax_m3_fused_ops::IcpWriterParams icp{};
+  bool const use_icp = index_world_size != 0;
+  auto same_device = [&](torch::stable::Tensor const& t) {
+    return t.is_cuda() && t.get_device_index() == qkv.get_device_index();
+  };
+  auto aligned = [](torch::stable::Tensor const& t, uintptr_t bytes) {
+    return reinterpret_cast<uintptr_t>(t.data_ptr()) % bytes == 0;
+  };
+  using Span = std::pair<uintptr_t, uintptr_t>;
+  auto span = [](torch::stable::Tensor const& t) {
+    uintptr_t const b = reinterpret_cast<uintptr_t>(t.data_ptr());
+    return Span(b, b + t.numel() * t.element_size());
+  };
+  auto disjoint = [](Span x, Span y) {
+    return x.second <= y.first || y.second <= x.first;
+  };
+  if (use_icp) {
+#ifndef VLLM_MINIMAX_M3_NVFP4
+    STD_TORCH_CHECK(false, "ICP writer requires NVIDIA CUDA 12.8 or newer");
+#endif
+    STD_TORCH_CHECK(index_world_size == 2 &&
+                        (index_rank == 0 || index_rank == 1) &&
+                        num_heads == 32 && num_kv_heads == 2 &&
+                        num_index_heads == 4 && !skip_index_branch && nvfp4_kv,
+                    "ICP writer requires TP2/Q32/KV2/I4/P128/R64 NVFP4");
+    STD_TORCH_CHECK(!index_slot_mapping.has_value(),
+                    "ICP index fragments use the parent slot_mapping");
+    STD_TORCH_CHECK(q_fp8_scale == 1.0, "ICP writer requires unit q_fp8_scale");
+    STD_TORCH_CHECK(icp_plan_abi == 4, "ICP writer device-plan ABI must be 4");
+    STD_TORCH_CHECK(qkv.dim() == 2 && qkv.size(0) < 2147483647LL,
+                    "ICP qkv must be [N,row] with int32 token extent");
+    // The index norm weights are present: ICP implies process_index.
+    STD_TORCH_CHECK(
+        same_device(positions) && positions.is_contiguous() &&
+            positions.numel() >= num_tokens && same_device(cos_sin_cache) &&
+            same_device(q_norm_weight) && q_norm_weight.is_contiguous() &&
+            same_device(k_norm_weight) && k_norm_weight.is_contiguous() &&
+            same_device(*index_q_norm_weight) &&
+            index_q_norm_weight->is_contiguous() &&
+            same_device(*index_k_norm_weight) &&
+            index_k_norm_weight->is_contiguous(),
+        "ICP inputs must be contiguous on the qkv device");
+    // Contiguous views can still begin at a misaligned storage offset. ICP
+    // loads projection rows and norm weights as uint2, and stores gathered
+    // model-dtype Q as uint2 / FP8 outputs as uint32.
+    STD_TORCH_CHECK(aligned(qkv, 8) && aligned(q_norm_weight, 8) &&
+                        aligned(k_norm_weight, 8) &&
+                        aligned(*index_q_norm_weight, 8) &&
+                        aligned(*index_k_norm_weight, 8),
+                    "ICP qkv and norm weights must be 8-byte aligned");
+    STD_TORCH_CHECK(!q_out || aligned(*q_out, 8),
+                    "ICP q_out must be 8-byte aligned");
+    STD_TORCH_CHECK((!q_fp8_out || aligned(*q_fp8_out, 4)) &&
+                        (!index_q_out || aligned(*index_q_out, 4)),
+                    "ICP FP8 gather outputs must be 4-byte aligned");
+    STD_TORCH_CHECK(kv_cache.has_value() == index_cache.has_value(),
+                    "ICP main and index caches must be bound together");
+    if (insert_kv) {
+      STD_TORCH_CHECK(
+          block_size == 128 && slot_mapping.has_value() &&
+              same_device(*slot_mapping) && slot_mapping->is_contiguous() &&
+              slot_mapping->numel() >= num_tokens,
+          "ICP insert requires P128 parent slots covering every token");
+      STD_TORCH_CHECK(same_device(*kv_cache) && same_device(*kv_k_scale) &&
+                          same_device(*kv_v_scale) &&
+                          kv_s_block >= 2 * nkv * block_size * 72,
+                      "ICP main cache/scales must be on the qkv device with "
+                      "full head slots");
+      STD_TORCH_CHECK(aligned(*kv_cache, 2) && kv_s_block % 2 == 0,
+                      "ICP main cache base/page stride must be 2-byte aligned");
+      auto const& idx = *index_cache;
+      STD_TORCH_CHECK(
+          same_device(idx) && idx.dim() == 3 &&
+              idx.scalar_type() ==
+                  torch::headeronly::ScalarType::Float8_e4m3fn &&
+              idx.size(1) == 64 && idx.size(2) == 128 && idx.stride(2) == 1 &&
+              idx.stride(1) >= 128 && idx.stride(0) >= 64 * idx.stride(1) &&
+              aligned(idx, 4) && idx.stride(0) % 4 == 0 &&
+              idx.stride(1) % 4 == 0,
+          "ICP index_cache must be aligned FP8 [pages,R,128] fragments");
+      icp.page_stride = idx.stride(0);
+      icp.row_stride = idx.stride(1);
+    }
+    for (auto const* out : {&q_out, &q_fp8_out, &index_q_out}) {
+      STD_TORCH_CHECK(!out->has_value() || same_device(out->value()),
+                      "ICP gather outputs must be on the qkv device");
+    }
+    STD_TORCH_CHECK(!index_q_out.has_value() ||
+                        index_q_out->scalar_type() ==
+                            torch::headeronly::ScalarType::Float8_e4m3fn,
+                    "ICP index_q_out must be FP8 e4m3");
+    icp.block_tokens = 128;
+    icp.rows_per_rank = 64;
+    icp.rank = static_cast<int32_t>(index_rank);
+    icp.world_size = static_cast<int32_t>(index_world_size);
+  } else {
+    STD_TORCH_CHECK(
+        index_rank == 0 && !write_icp_metadata,
+        "ICP fragment/metadata arguments require index_world_size=2");
+  }
+
+  if (write_icp_metadata) {
+    // write_icp_metadata implies use_icp, whose checks cover the geometry.
+    STD_TORCH_CHECK(insert_kv,
+                    "ICP live metadata requires the inserting sparse producer");
+    STD_TORCH_CHECK(icp_num_reqs >= 0 && icp_num_reqs < 2147483647LL,
+                    "icp_num_reqs must be a nonnegative int32 count");
+    auto check_tensor = [&](std::optional<torch::stable::Tensor> const& value,
+                            torch::headeronly::ScalarType dtype, int dims,
+                            char const* name) {
+      STD_TORCH_CHECK(value.has_value(), "write_icp_metadata requires ", name);
+      STD_TORCH_CHECK(same_device(*value) && value->is_contiguous() &&
+                          value->scalar_type() == dtype && value->dim() == dims,
+                      name,
+                      " must be contiguous, on the qkv device, and have the "
+                      "declared dtype and rank");
+    };
+    check_tensor(icp_query_start_loc, torch::headeronly::ScalarType::Int, 1,
+                 "icp_query_start_loc");
+    check_tensor(icp_seq_lens, torch::headeronly::ScalarType::Int, 1,
+                 "icp_seq_lens");
+    check_tensor(icp_positions, torch::headeronly::ScalarType::Long, 1,
+                 "icp_positions");
+    check_tensor(icp_active, torch::headeronly::ScalarType::Bool, 1,
+                 "icp_active");
+    check_tensor(icp_local_nvalid, torch::headeronly::ScalarType::Int, 1,
+                 "icp_local_nvalid");
+    check_tensor(icp_local_forced, torch::headeronly::ScalarType::Int, 1,
+                 "icp_local_forced");
+    check_tensor(icp_global_nvalid, torch::headeronly::ScalarType::Int, 1,
+                 "icp_global_nvalid");
+    check_tensor(icp_forced, torch::headeronly::ScalarType::Int, 1,
+                 "icp_forced");
+    check_tensor(icp_n_ordinary, torch::headeronly::ScalarType::Int, 1,
+                 "icp_n_ordinary");
+    check_tensor(icp_candidates, torch::headeronly::ScalarType::Float, 4,
+                 "icp_candidates");
+    int64_t const extent = icp_positions->numel();
+    STD_TORCH_CHECK(extent > 0 && extent >= num_tokens && extent < 2147483647LL,
+                    "ICP metadata extent must cover the producer token extent");
+    STD_TORCH_CHECK(
+        icp_query_start_loc->numel() >= icp_num_reqs + 1 &&
+            icp_seq_lens->numel() >= icp_num_reqs,
+        "ICP metadata scheduler inputs are shorter than icp_num_reqs");
+    STD_TORCH_CHECK(
+        icp_active->numel() == extent && icp_local_nvalid->numel() == extent &&
+            icp_local_forced->numel() == extent &&
+            icp_global_nvalid->numel() == extent &&
+            icp_forced->numel() == extent && icp_n_ordinary->numel() == extent,
+        "ICP retained metadata planes must have the same extent");
+    STD_TORCH_CHECK(
+        icp_candidates->size(0) == extent && icp_candidates->size(1) == 4 &&
+            icp_candidates->size(2) == 16 && icp_candidates->size(3) == 2,
+        "icp_candidates must be float32 [extent,4,16,2] C4 carriers");
+    STD_TORCH_CHECK(
+        disjoint(span(positions), span(*icp_positions)),
+        "ICP metadata positions must not alias the RoPE input positions");
+    auto& meta = icp.metadata;
+    meta.query_start_loc = icp_query_start_loc->const_data_ptr<int32_t>();
+    meta.seq_lens = icp_seq_lens->const_data_ptr<int32_t>();
+    meta.positions = icp_positions->mutable_data_ptr<int64_t>();
+    meta.active = reinterpret_cast<uint8_t*>(icp_active->data_ptr());
+    meta.local_nvalid = icp_local_nvalid->mutable_data_ptr<int32_t>();
+    meta.local_forced = icp_local_forced->mutable_data_ptr<int32_t>();
+    meta.global_nvalid = icp_global_nvalid->mutable_data_ptr<int32_t>();
+    meta.forced = icp_forced->mutable_data_ptr<int32_t>();
+    meta.n_ordinary = icp_n_ordinary->mutable_data_ptr<int32_t>();
+    meta.candidates = reinterpret_cast<int32_t*>(icp_candidates->data_ptr());
+    meta.num_reqs = static_cast<int32_t>(icp_num_reqs);
+    meta.num_rows = static_cast<int32_t>(extent);
+    meta.rank = static_cast<int32_t>(index_rank);
+    meta.meta_blocks = static_cast<int32_t>((extent + 7) / 8);
+    if (icp_qo_offsets.has_value()) {
+      check_tensor(icp_qo_offsets, torch::headeronly::ScalarType::Int, 2,
+                   "icp_qo_offsets");
+      STD_TORCH_CHECK(
+          icp_chunk_width > 0 && icp_chunk_width < 2147483647LL,
+          "icp_chunk_width must be positive when qo offsets are supplied");
+      STD_TORCH_CHECK(
+          icp_qo_offsets->size(0) >=
+                  (extent + icp_chunk_width - 1) / icp_chunk_width &&
+              icp_qo_offsets->size(1) > 0 &&
+              icp_qo_offsets->size(1) < 2147483647LL,
+          "icp_qo_offsets must cover every metadata chunk slot");
+      meta.qo_offsets = icp_qo_offsets->mutable_data_ptr<int32_t>();
+      meta.chunk_width = static_cast<int32_t>(icp_chunk_width);
+      meta.qo_stride = static_cast<int32_t>(icp_qo_offsets->stride(0));
+      meta.qo_slots = static_cast<int32_t>(icp_qo_offsets->size(0));
+    } else {
+      STD_TORCH_CHECK(icp_chunk_width == 0,
+                      "icp_chunk_width requires icp_qo_offsets");
+    }
+    bool const any_plan = icp_plan_segments.has_value() ||
+                          icp_plan_work.has_value() ||
+                          icp_plan_header.has_value();
+    if (any_plan) {
+      STD_TORCH_CHECK(icp_qo_offsets.has_value(),
+                      "the ICP device plan is chunked by icp_chunk_width and "
+                      "requires icp_qo_offsets");
+      check_tensor(icp_plan_segments, torch::headeronly::ScalarType::Int, 3,
+                   "icp_plan_segments");
+      check_tensor(icp_plan_work, torch::headeronly::ScalarType::Long, 2,
+                   "icp_plan_work");
+      check_tensor(icp_plan_header, torch::headeronly::ScalarType::Int, 2,
+                   "icp_plan_header");
+      int64_t const slots = icp_plan_segments->size(0);
+      int64_t const plan_blocks =
+          (extent + icp_chunk_width - 1) / icp_chunk_width;
+      STD_TORCH_CHECK(icp_plan_work->size(0) == slots &&
+                          icp_plan_header->size(0) == slots &&
+                          icp_plan_header->size(1) == 4 &&
+                          icp_plan_segments->size(1) == 5,
+                      "ICP device plan planes must be [slots,5,M+1], "
+                      "[slots,num_ctas+3*max_work] and [slots,4]");
+      STD_TORCH_CHECK(slots >= plan_blocks,
+                      "ICP device plan must cover every metadata chunk slot");
+      STD_TORCH_CHECK(
+          icp_plan_num_ctas >= 1 &&
+              icp_plan_num_ctas <= vllm::minimax_m3_fused_ops::kIcpPlanThreads,
+          "icp_plan_num_ctas must be in [1, 256]");
+      STD_TORCH_CHECK(icp_plan_num_heads >= 1 && icp_plan_num_heads <= 0xFFFF,
+                      "icp_plan_num_heads must be in [1, 65535]");
+      int64_t const max_segments = icp_plan_segments->size(2) - 1;
+      STD_TORCH_CHECK(max_segments >= 1 && max_segments <= 0xFFFF,
+                      "ICP device plan segment capacity must be in [1, 65535]");
+      int64_t const work_cols = icp_plan_work->size(1) - icp_plan_num_ctas;
+      STD_TORCH_CHECK(
+          work_cols >= 3 && work_cols % 3 == 0 && work_cols / 3 < 2147483647LL,
+          "icp_plan_work must hold num_ctas + 3 * max_work columns");
+      STD_TORCH_CHECK(extent + icp_chunk_width < 2147483647LL,
+                      "ICP device plan chunk origins must fit int32");
+      Span const planes[] = {span(*icp_plan_segments), span(*icp_plan_work),
+                             span(*icp_plan_header), span(*icp_qo_offsets)};
+      for (int i = 0; i < 4; ++i) {
+        for (int j = i + 1; j < 4; ++j) {
+          STD_TORCH_CHECK(disjoint(planes[i], planes[j]),
+                          "ICP device plan planes must not alias each other "
+                          "or icp_qo_offsets");
+        }
+      }
+      auto& plan = meta.plan;
+      plan.segments = icp_plan_segments->mutable_data_ptr<int32_t>();
+      plan.work = reinterpret_cast<uint64_t*>(
+          icp_plan_work->mutable_data_ptr<int64_t>());
+      plan.header = icp_plan_header->mutable_data_ptr<int32_t>();
+      plan.seg_slot_stride = icp_plan_segments->stride(0);
+      plan.work_slot_stride = icp_plan_work->stride(0);
+      plan.seg_row_stride = static_cast<int32_t>(icp_plan_segments->stride(1));
+      plan.max_segments = static_cast<int32_t>(max_segments);
+      plan.max_work = static_cast<int32_t>(work_cols / 3);
+      plan.num_ctas = static_cast<int32_t>(icp_plan_num_ctas);
+      plan.num_heads = static_cast<int32_t>(icp_plan_num_heads);
+      plan.blocks = static_cast<int32_t>(plan_blocks);
+    } else {
+      STD_TORCH_CHECK(
+          icp_plan_num_ctas == 0 && icp_plan_num_heads == 0,
+          "icp_plan_num_ctas/num_heads require the ICP device plan");
+    }
+  } else {
+    STD_TORCH_CHECK(!icp_query_start_loc && !icp_seq_lens && !icp_positions &&
+                        !icp_active && !icp_local_nvalid && !icp_local_forced &&
+                        !icp_global_nvalid && !icp_forced && !icp_n_ordinary &&
+                        !icp_candidates && !icp_qo_offsets &&
+                        icp_num_reqs == 0 && icp_chunk_width == 0 &&
+                        !icp_plan_segments && !icp_plan_work &&
+                        !icp_plan_header && icp_plan_num_ctas == 0 &&
+                        icp_plan_num_heads == 0,
+                    "ICP metadata arguments require write_icp_metadata=True");
+  }
+
+  STD_TORCH_CHECK(!nvfp4_kv || insert_kv || use_icp,
                   "nvfp4 kv_cache_dtype requires kv_cache (insert mode)");
   float const* kv_k_scale_ptr =
-      nvfp4_kv ? kv_k_scale->const_data_ptr<float>() : nullptr;
+      nvfp4_kv && insert_kv ? kv_k_scale->const_data_ptr<float>() : nullptr;
   float const* kv_v_scale_ptr =
-      nvfp4_kv ? kv_v_scale->const_data_ptr<float>() : nullptr;
+      nvfp4_kv && insert_kv ? kv_v_scale->const_data_ptr<float>() : nullptr;
 
   const torch::stable::accelerator::DeviceGuard device_guard(
       qkv.get_device_index());
   auto stream = get_current_cuda_stream(qkv.get_device_index());
+
+  STD_TORCH_CHECK(!use_icp || vllm::minimax_m3_fused_ops::getSMVersion() >= 100,
+                  "ICP writer requires SM100 or newer");
 
   if (nvfp4_kv) {
 #ifndef USE_ROCM

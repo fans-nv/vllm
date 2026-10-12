@@ -731,6 +731,9 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
     alone does not release the KV cache memory on teardown paths.
     """
     for layer in layers:
+        release_kv_cache = getattr(layer, "release_kv_cache", None)
+        if release_kv_cache is not None:
+            release_kv_cache()
         if not hasattr(layer, "kv_cache"):
             continue
         kv_cache = layer.kv_cache
