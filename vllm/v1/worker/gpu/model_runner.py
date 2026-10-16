@@ -751,6 +751,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             varlen_decode=self.adaptive_verification is not None,
             ubatch_runner=self.ubatch_runner,
         )
+        self.decode_graphs_exclude_prefill = any(
+            getattr(group.get_metadata_builder(0), "cudagraph_decode_phase_only", False)
+            for groups in self.attn_groups
+            for group in groups
+        )
         if self.cache_config.kv_sharing_fast_prefill and self.pcp_manager is None:
             self.fast_prefill = FastPrefillHelper(
                 self.cudagraph_manager, self.max_num_tokens
@@ -1760,6 +1765,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # Varlen decode graphs replay decodes only, and their bound
                 # alone would admit a short prefill.
                 max_query_len = None
+                if self.decode_graphs_exclude_prefill:
+                    uniform_tok_count = None
             if self.pcp_manager is not None:
                 num_toks = self.pcp_manager.get_num_tokens_for_dispatch(
                     batch_req_state.num_scheduled_tokens,
@@ -2353,11 +2360,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if hasattr(self, "model_state") and self.model_state.supports_mm_inputs:
             self.model_state.encoder_runner.clear()
         free_before_shutdown(self.vllm_config)
+        speculator = getattr(self, "speculator", None)
+        # Close model-owned peer resources while the TP group is still alive.
+        models = (getattr(self, "model", None), getattr(speculator, "model", None))
+        for model in dict.fromkeys(models):
+            if callable(close := getattr(model, "shutdown_model_resources", None)):
+                close()
         if hasattr(self, "model_state"):
             del self.model_state
         # Detach the layer-level KV/state cache tensors before dropping the
         # models; the model objects can outlive this runner.
-        speculator = getattr(self, "speculator", None)
         if speculator is not None:
             if draft_model := getattr(speculator, "model", None):
                 clear_layer_kv_caches(draft_model.modules())

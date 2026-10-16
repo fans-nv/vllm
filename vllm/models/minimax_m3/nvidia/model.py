@@ -13,6 +13,7 @@ The MiniMax-M3-preview config selects a single set of branches:
 """
 
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -89,6 +90,10 @@ from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+
+if TYPE_CHECKING:
+    from .sparse_attention_icp import MiniMaxM3SparseICPAttention
+
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
@@ -709,8 +714,18 @@ class MiniMaxM3DecoderLayer(nn.Module):
             force_sparse_attn or layer_id in _sparse_attention_layer_ids(config)
         )
 
+        self.self_attn: (
+            MiniMaxM3SparseAttention | MiniMaxM3SparseICPAttention | MiniMaxM3Attention
+        )
         if is_sparse_attention_layer:
-            self.self_attn = MiniMaxM3SparseAttention(
+            sparse_layer_cls: type[
+                MiniMaxM3SparseAttention | MiniMaxM3SparseICPAttention
+            ] = MiniMaxM3SparseAttention
+            if vllm_config.attention_config.minimax_m3_msa_indexer_backend == "msa_icp":
+                from . import sparse_attention_icp
+
+                sparse_layer_cls = sparse_attention_icp.MiniMaxM3SparseICPAttention
+            self.self_attn = sparse_layer_cls(
                 config=config,
                 layer_id=layer_id,
                 quant_config=quant_config,
@@ -871,6 +886,18 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             layer.fuse_input_allreduce = idx > 0 and prev_defers
             prev_defers = layer.ffn_all_reduce_deferred
         self.fuse_final_norm_allreduce = prev_defers
+
+        if vllm_config.attention_config.minimax_m3_msa_indexer_backend == "msa_icp":
+            from .sparse_attention_icp import build_model_icp_indexer
+
+            build_model_icp_indexer(self, vllm_config)
+
+    def shutdown_model_resources(self) -> None:
+        """Drain the model-scoped ICP indexer before destroying its TP group."""
+        indexer = getattr(self, "_icp_indexer", None)
+        if indexer is not None:
+            indexer.close()
+            self._icp_indexer = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1047,6 +1074,13 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
+    def shutdown_model_resources(self) -> None:
+        """Runner shutdown: close ICP peer resources before TP teardown."""
+        for module in self.modules():
+            close = getattr(module, "shutdown_model_resources", None)
+            if module is not self and callable(close):
+                close()
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_text_config
@@ -1186,6 +1220,9 @@ class MiniMaxM3SparseForConditionalGeneration(
     @property
     def lm_head(self) -> nn.Module:
         return self.language_model.lm_head
+
+    def shutdown_model_resources(self) -> None:
+        self.language_model.shutdown_model_resources()
 
     def _parse_and_validate_image_input(self, **kwargs: object) -> dict | None:
         pixel_values = kwargs.pop("pixel_values", None)

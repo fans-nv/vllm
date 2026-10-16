@@ -626,6 +626,9 @@ class FullAttentionSpec(AttentionSpec):
         assert all(isinstance(spec, FullAttentionSpec) for spec in specs), (
             "All attention layers in the same KV cache group must be FullAttentionSpec."
         )
+        assert all(s.page_size_bytes == specs[0].page_size_bytes for s in specs), (
+            "All attention layers in the same KV cache group must share a page size."
+        )
 
         sliding_window = set(
             spec.sliding_window for spec in specs if spec.sliding_window is not None

@@ -514,7 +514,29 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "int block_size, Tensor!? q_out, Tensor!? index_q_out, "
       "str kv_cache_dtype, bool skip_index_branch=False, "
       "Tensor!? q_fp8_out=None, float q_fp8_scale=1.0, "
-      "Tensor? kv_k_scale=None, Tensor? kv_v_scale=None) -> ()");
+      "Tensor? kv_k_scale=None, Tensor? kv_v_scale=None, "
+      "int index_rank=0, "
+      "int index_world_size=0, "
+      "bool write_icp_metadata=False, "
+      "Tensor? icp_query_start_loc=None, "
+      "Tensor? icp_seq_lens=None, "
+      "int icp_num_reqs=0, "
+      "Tensor!? icp_positions=None, "
+      "Tensor!? icp_active=None, "
+      "Tensor!? icp_local_nvalid=None, "
+      "Tensor!? icp_local_forced=None, "
+      "Tensor!? icp_global_nvalid=None, "
+      "Tensor!? icp_forced=None, "
+      "Tensor!? icp_n_ordinary=None, "
+      "Tensor!? icp_candidates=None, "
+      "Tensor!? icp_qo_offsets=None, "
+      "int icp_chunk_width=0, "
+      "Tensor!? icp_plan_segments=None, "
+      "Tensor!? icp_plan_work=None, "
+      "Tensor!? icp_plan_header=None, "
+      "int icp_plan_num_ctas=0, "
+      "int icp_plan_num_heads=0, "
+      "int icp_plan_abi=4) -> ()");
 
 #ifdef VLLM_ENABLE_FUSED_KDA_DECODE
   ops.def(

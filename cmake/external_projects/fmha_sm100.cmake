@@ -17,7 +17,7 @@ else()
   FetchContent_Declare(
     fmha_sm100
     GIT_REPOSITORY https://github.com/vllm-project/MSA.git
-    GIT_TAG 968061ab16cb14991a5c7d4c0e8eabf531be0dcf
+    GIT_TAG 1ce59331b349cd9e139a6146cf60f9dd18ab36b4
     GIT_PROGRESS TRUE
     CONFIGURE_COMMAND ""
     BUILD_COMMAND ""
@@ -58,6 +58,12 @@ install(DIRECTORY "${FMHA_SM100_PY_ROOT}/csrc/"
 
 install(DIRECTORY "${FMHA_SM100_PY_ROOT}/decode_q8kv4/"
   DESTINATION vllm/third_party/fmha_sm100/decode_q8kv4
+  COMPONENT fmha_sm100
+  PATTERN "__pycache__" EXCLUDE
+  PATTERN "*.pyc" EXCLUDE)
+
+install(DIRECTORY "${FMHA_SM100_PY_ROOT}/icp/"
+  DESTINATION vllm/third_party/fmha_sm100/icp
   COMPONENT fmha_sm100
   PATTERN "__pycache__" EXCLUDE
   PATTERN "*.pyc" EXCLUDE)
